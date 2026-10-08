@@ -1,10 +1,8 @@
 # I&C Laundry ETL Pipeline — Stage 1: Data Extraction
 
-**Status:** Proposed extraction-stage design. Confirm deployment details before treating this as an operating procedure.
+## Objective
 
-**Source basis:** Scope and business context follow _I-and-C-Laundry-ETL-Technical-Metadata-Branch-Only_. Its schema was supplied by the project owner, not checked against the live database. Verify the listed tables and columns before implementation.
-
-**Boundary:** This document covers extraction, extraction-level validation, run logging, and handover only. Cleaning, standardization, business calculations, and reporting-table loading belong to later stages.
+The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
 ## 1. Data Source and Extraction Specification
 
