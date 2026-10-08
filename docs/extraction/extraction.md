@@ -1,399 +1,160 @@
 # I&C Laundry Daily Branch Reporting ETL
 
-## Stage 1 – Data Extraction
+## Stage 1: Data Extraction
 
 ### Objective
 
-The objective of this stage is to extract data from the identified source system and prepare a documented, traceable, and validated dataset for the next stage of the ETL pipeline.
-
----
+The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
 ## 1. Data Source and Extraction Specification
 
-### Source System
+### Source system
 
-The source system is the shared Supabase PostgreSQL database used by I&C Laundry for its Main, Calzada, and Nasugbu branches.
+I&C Laundry's shared operational system records orders, payments, expenses, customers, and branch information for its Main, Calzada, and Nasugbu branches. These records are the source for daily branch reporting.
 
-The database stores operational records such as laundry orders, payments, customers, expenses, and branch information. These records are used as the source for daily branch reporting.
+### Source database
 
-### Source Database and DBMS
-
-- **Database:** I&C Laundry shared database
+- **Database:** I&C Laundry operational database
 - **DBMS:** PostgreSQL
-- **Hosting:** Supabase
+- **Platform:** Supabase
 - **Schema:** `public`
 
-### Extraction Method
+### Extraction method
 
-The extraction uses SQL `SELECT` queries through an authorized read-only database connection.
+- **Mode:** Full-history extraction of the selected fields on each run; no incremental cursor is used.
+- **Consistency:** Read the source tables in one read-only `REPEATABLE READ` transaction.
+- **Output:** Pass the selected source fields to the following pipeline stage without changing their values or row structure.
 
-The extraction is performed as a full-history extraction. All available records from the selected source tables are extracted during each run. No incremental field or watermark is used.
+### Extraction technology
 
-The five source tables are read from a consistent PostgreSQL snapshot. The tables are extracted separately without joins so that the original source row structure is preserved.
+- PostgreSQL / Supabase
+- SQL `SELECT` queries through a read-only PostgreSQL connection
+- Supabase Cron / `pg_cron` for scheduled orchestration
 
-### Extraction Technology
+### Extraction schedule
 
-- PostgreSQL
-- Supabase
-- SQL
-- Supabase Cron / PostgreSQL scheduling
+Run daily at **01:00 Asia/Manila**. If the scheduler uses UTC, use `0 17 * * *`.
 
-### Extraction Schedule
+### Extraction scope
 
-The extraction is scheduled daily at **01:00 Asia/Manila time**.
+Extract selected columns from `public.branches`, `public.customers`, `public.orders`, `public.payments`, and `public.expenses`. Include all available history. Retain cancelled orders, soft-deleted expenses, and NULL values for validation and later-stage handling.
 
-The equivalent UTC cron schedule is:
+### Source limitations and assumptions
 
-`0 17 * * *`
-
-### Extraction Scope
-
-The extraction includes the following source tables:
-
-- `public.branches`
-- `public.customers`
-- `public.orders`
-- `public.payments`
-- `public.expenses`
-
-Only the columns required for the reporting process are extracted.
-
-Source values, data types, and NULL values are preserved during extraction.
-
-Cancelled orders, soft-deleted expenses, records with missing dates, and records with missing branch assignments are not removed during extraction. These records are retained for validation and are handled by later stages when applicable.
-
-### Source Limitations and Assumptions
-
-The extraction is based on the source schema provided for the project.
-
-The following conditions are considered during extraction:
-
-- Some branch, customer, or order date fields may contain NULL values.
-- Historical records may be corrected after their original creation.
-- Payments may be recorded after an order is created.
-- Source relationships are expected to follow the defined foreign keys.
-- The extraction uses the Asia/Manila time zone for the daily schedule.
-- Full-history extraction may increase in size as more records are added.
-
----
+- The extraction account must have read access to all five source tables.
+- `orders.created_at` may be NULL. Preserve the row and report the missing date.
+- Branch references may be NULL. Preserve the row and report the missing reference.
+- Payments may be entered after an order is created, and historical records may be corrected. Full-history extraction includes those changes in a later run.
+- Extraction volume grows as source history accumulates.
 
 ## 2. Source Tables and Column Specification
 
-### `public.branches`
+| Table              | Purpose            | Selected columns and types                                                                                                                                               | Primary key and relationships                                                                         | Reason for inclusion                                                                  |
+| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `public.branches`  | Branch reference   | `id UUID`; `branch_name TEXT`; `name TEXT NULL`; `code TEXT NULL`                                                                                                        | PK: `id`; referenced by order, payment, and expense branch IDs.                                       | Identifies branches for branch-level reporting.                                       |
+| `public.customers` | Customer reference | `id UUID`                                                                                                                                                                | PK: `id`; referenced by `orders.customer_id`.                                                         | Supports customer activity counts without extracting contact details.                 |
+| `public.orders`    | Order transactions | `id UUID`; `order_number TEXT`; `branch_id UUID NULL`; `customer_id UUID NULL`; `created_at TIMESTAMPTZ NULL`; `status TEXT`; `weight_kg NUMERIC`; `total_price NUMERIC` | PK: `id`; unique: `order_number`; branch and customer IDs reference `branches.id` and `customers.id`. | Supports order counts, statuses, weight, value, and customer activity.                |
+| `public.payments`  | Payment ledger     | `id UUID`; `order_id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `paid_at TIMESTAMPTZ`; `source TEXT`                                                                | PK: `id`; order and branch IDs reference `orders.id` and `branches.id`.                               | Supports payment collection reporting by date and branch.                             |
+| `public.expenses`  | Expense records    | `id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `expense_date DATE`; `deleted_at TIMESTAMPTZ NULL`                                                                   | PK: `id`; branch ID references `branches.id`.                                                         | Supports branch expense reporting; soft-deleted rows are retained for later handling. |
 
-**Purpose:** Stores branch information used to identify the laundry branches.
-
-| Column        | Type | Description                     |
-| ------------- | ---- | ------------------------------- |
-| `id`          | UUID | Unique identifier of the branch |
-| `branch_name` | TEXT | Branch label used for reporting |
-| `name`        | TEXT | Branch name                     |
-| `code`        | TEXT | Branch code                     |
-
-**Primary Key:** `id`
-
-**Relationships:** Referenced by branch IDs in orders, payments, and expenses.
-
-**Reason for Inclusion:** Provides branch identification and labels needed for branch-level reporting.
-
----
-
-### `public.customers`
-
-**Purpose:** Stores customer records used to determine customer activity.
-
-| Column | Type | Description                       |
-| ------ | ---- | --------------------------------- |
-| `id`   | UUID | Unique identifier of the customer |
-
-**Primary Key:** `id`
-
-**Relationships:** Referenced by `orders.customer_id`.
-
-**Reason for Inclusion:** Provides customer identifiers needed for customer-related reporting and unique customer counts.
-
----
-
-### `public.orders`
-
-**Purpose:** Stores laundry order transactions.
-
-| Column        | Type        | Description                              |
-| ------------- | ----------- | ---------------------------------------- |
-| `id`          | UUID        | Unique identifier of the order           |
-| `branch_id`   | UUID        | Branch associated with the order         |
-| `customer_id` | UUID        | Customer associated with the order       |
-| `created_at`  | TIMESTAMPTZ | Date and time when the order was created |
-| `status`      | TEXT        | Current status of the order              |
-| `weight_kg`   | NUMERIC     | Laundry weight in kilograms              |
-| `total_price` | NUMERIC     | Total value of the order                 |
-
-**Primary Key:** `id`
-
-**Relationships:** References `branches.id` and `customers.id`.
-
-**Reason for Inclusion:** Provides order counts, order status, customer activity, laundry weight, demand information, and order value.
-
-All order statuses are retained during extraction.
-
----
-
-### `public.payments`
-
-**Purpose:** Stores payment records associated with laundry orders.
-
-| Column      | Type        | Description                             |
-| ----------- | ----------- | --------------------------------------- |
-| `id`        | UUID        | Unique identifier of the payment        |
-| `order_id`  | UUID        | Order associated with the payment       |
-| `branch_id` | UUID        | Branch associated with the payment      |
-| `amount`    | NUMERIC     | Payment amount                          |
-| `paid_at`   | TIMESTAMPTZ | Date and time when payment was received |
-| `source`    | TEXT        | Payment source                          |
-
-**Primary Key:** `id`
-
-**Relationships:** References `orders.id` and `branches.id`.
-
-**Reason for Inclusion:** Provides payment records and cash collection information for reporting.
-
----
-
-### `public.expenses`
-
-**Purpose:** Stores branch expense records.
-
-| Column         | Type        | Description                                    |
-| -------------- | ----------- | ---------------------------------------------- |
-| `id`           | UUID        | Unique identifier of the expense               |
-| `branch_id`    | UUID        | Branch associated with the expense             |
-| `amount`       | NUMERIC     | Expense amount                                 |
-| `expense_date` | DATE        | Date of the expense                            |
-| `deleted_at`   | TIMESTAMPTZ | Indicates whether the expense was soft-deleted |
-
-**Primary Key:** `id`
-
-**Relationships:** References `branches.id`.
-
-**Reason for Inclusion:** Provides expense information needed for branch reporting.
-
-Soft-deleted expenses are retained during extraction.
-
----
-
-### Row-Level Extraction
-
-Each extracted row represents one row from its corresponding source table.
-
-The five tables are preserved separately during extraction. No one-to-many joins are performed during this stage to avoid changing the original row structure or multiplying records.
-
----
+Each extracted row retains the grain of its source table. Do not join orders, payments, and expenses during extraction.
 
 ## 3. Extraction Validation and Data Quality Checks
 
-The following checks are performed at the extraction level to ensure that the extracted data is complete, reliable, and suitable for the next ETL stage.
+| Check name                  | Target                                                           | Purpose                                    | Validation criteria                                                                                                                                          |
+| --------------------------- | ---------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Source connection           | PostgreSQL connection                                            | Confirm source accessibility.              | **PASS:** read-only connection succeeds. **FAIL:** connection or authentication fails.                                                                       |
+| Required tables and columns | Five source tables and selected columns                          | Detect missing or changed schema.          | **PASS:** all required tables and columns exist with compatible types. **FAIL:** a required table or column is missing or incompatible.                      |
+| Required identifiers        | `id` in each table and `orders.order_number`                     | Ensure records can be identified.          | **PASS:** identifiers are present. **FAIL:** a required identifier is NULL.                                                                                  |
+| Key uniqueness              | Table `id` fields and `orders.order_number`                      | Detect duplicate records or order numbers. | **PASS:** all values are unique. **FAIL:** duplicate values are found.                                                                                       |
+| Relationship check          | Branch, customer, and order references                           | Identify unresolved relationships.         | **PASS:** each non-NULL reference matches a key in its source table. **WARNING:** a nullable reference is NULL. **FAIL:** a non-NULL reference has no match. |
+| Record-count completeness   | Source and extracted dataset per table                           | Confirm all snapshot rows were extracted.  | **PASS:** source and output counts match. **FAIL:** counts differ or an output is incomplete.                                                                |
+| Date availability           | `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | Identify dates needed by later reporting.  | **PASS:** required dates are present. **WARNING:** nullable `orders.created_at` is NULL. **FAIL:** a required date is missing or invalid.                    |
+| Extraction interruption     | Run and output datasets                                          | Detect failed or partial runs.             | **PASS:** all reads and writes complete. **FAIL:** a query or output operation fails; do not hand over partial data.                                         |
+| Snapshot consistency        | All five table reads                                             | Ensure reads use one source snapshot.      | **PASS:** all reads use the same `REPEATABLE READ` transaction. **FAIL:** reads use inconsistent snapshots.                                                  |
 
-| Check Name                    | Target                                 | Purpose                                             | Validation Criteria                                |
-| ----------------------------- | -------------------------------------- | --------------------------------------------------- | -------------------------------------------------- |
-| Source Connection Check       | Database connection                    | Confirm that the source database can be accessed    | Connection is successful                           |
-| Required Table Check          | Five source tables                     | Confirm that all required tables are available      | All required tables exist                          |
-| Required Column Check         | Selected source columns                | Confirm that required columns are available         | All required columns exist                         |
-| Required ID Check             | Primary and required identifiers       | Check for missing required identifiers              | Required IDs are not NULL                          |
-| Primary Key Uniqueness        | Primary key columns                    | Detect duplicate source records                     | Primary key values are unique                      |
-| Foreign Key Check             | Branch, customer, and order references | Check source relationships                          | References are valid or reported as warnings       |
-| Record Count Check            | Each source table                      | Confirm that records were completely extracted      | Extracted count matches the source count           |
-| Date Availability Check       | Date and timestamp columns             | Identify missing dates needed for reporting         | Missing dates are recorded as validation warnings  |
-| Extraction Interruption Check | Extraction process                     | Detect incomplete extraction                        | Extraction completes successfully                  |
-| Snapshot Consistency Check    | Extracted source tables                | Ensure the tables belong to the same extraction run | Tables are extracted from the same source snapshot |
-| Value Serialization Check     | Extracted values                       | Confirm that source values can be stored correctly  | Values and data types are preserved                |
-
-Validation results are recorded with the extraction run.
-
-Warnings do not automatically remove or modify source records. Cleaning, standardization, filtering, and business transformations are handled in the Transformation Stage.
-
----
+Record validation results for each table and for the overall run. These checks do not clean or transform data.
 
 ## 4. Extraction Metadata and Log Specification
 
-The extraction process records metadata for every run.
+| Field                   | Purpose                                             | Example value or format              |
+| ----------------------- | --------------------------------------------------- | ------------------------------------ |
+| `pipeline_run_id`       | Identifies and links one run.                       | UUID, e.g. `7d1e...`                 |
+| `table_name`            | Identifies the extracted table.                     | `public.orders`                      |
+| `extraction_started_at` | Records extraction start time.                      | ISO 8601 timestamp with timezone     |
+| `extraction_ended_at`   | Records extraction end time.                        | ISO 8601 timestamp with timezone     |
+| `extraction_status`     | Records the run result.                             | `PASS`, `WARNING`, or `FAIL`         |
+| `records_read`          | Number of source rows read.                         | Non-negative integer                 |
+| `records_extracted`     | Number of rows written to staging.                  | Non-negative integer                 |
+| `records_rejected`      | Number not passed to the next stage, if applicable. | Non-negative integer; normally `0`   |
+| `extraction_window`     | Identifies the source history included.             | `All available history`              |
+| `validation_results`    | Records validation outcomes.                        | JSON, e.g. `{"orders_count":"PASS"}` |
+| `error_code`            | Categorizes an extraction error.                    | `SOURCE_TIMEOUT` or `NULL`           |
+| `error_message`         | Describes an error for operators.                   | Short diagnostic or `NULL`           |
+| `duration_ms`           | Records run duration.                               | Non-negative integer                 |
 
-| Metadata / Log Field    | Purpose                                               |
-| ----------------------- | ----------------------------------------------------- |
-| `pipeline_run_id`       | Identifies a specific extraction run                  |
-| `pipeline_name`         | Identifies the ETL pipeline                           |
-| `source_system`         | Identifies the source database                        |
-| `table_name`            | Identifies the extracted table                        |
-| `snapshot_started_at`   | Records when the source snapshot started              |
-| `extraction_started_at` | Records the extraction start time                     |
-| `extraction_ended_at`   | Records the extraction end time                       |
-| `extraction_status`     | Records whether the extraction succeeded or failed    |
-| `records_read`          | Records the number of records read                    |
-| `records_extracted`     | Records the number of records successfully extracted  |
-| `records_rejected`      | Records the number of rejected records, if applicable |
-| `extraction_window`     | Records the extraction date or range                  |
-| `validation_results`    | Records the results of validation checks              |
-| `error_code`            | Identifies an extraction error                        |
-| `error_message`         | Describes the extraction error                        |
-| `duration_ms`           | Records the extraction duration                       |
-| `output_reference`      | Identifies the extracted output                       |
-| `source_row_count`      | Records the source row count                          |
-| `output_checksum`       | Helps verify the extracted output                     |
-
-### Purpose of Metadata and Logs
-
-The metadata and logs are used for:
-
-- Monitoring extraction runs
-- Troubleshooting extraction problems
-- Auditing extraction activities
-- Tracking extraction history
-- Supporting recovery when an extraction fails
-
-A failed retry receives a new pipeline run ID so that each run can be tracked separately.
-
----
+Use the metadata to monitor runs, troubleshoot failures, audit extraction activity, and support recovery. A retry receives a new `pipeline_run_id`.
 
 ## 5. Log Retention and Access
 
-### Retention Period
-
-Extraction logs are retained for at least **one year**.
-
-This provides sufficient history for monitoring, troubleshooting, auditing, and reviewing previous extraction runs.
-
-### Storage
-
-Metadata and extraction logs are stored separately from the raw extracted datasets.
-
-### Access
-
-Access to extraction metadata and logs is restricted to authorized personnel responsible for the ETL pipeline and system operations.
-
-### Archiving
-
-Older logs may be archived when necessary while maintaining their required retention period.
-
-### Deletion
-
-Logs are deleted only after the retention period has ended and there is no remaining operational or audit requirement for them.
-
-Operational records and audit records are treated separately when applicable.
-
----
+- **Retention:** Keep operational extraction logs for at least one year to support monitoring and recovery.
+- **Storage:** Store logs in a restricted ETL operations log store, separate from source records.
+- **Access:** Limit log access to authorized ETL operators and system administrators. Restrict source credentials to the extraction runtime and authorized database administrators.
+- **Archiving:** Archive logs when needed for audit or recovery, preserving run IDs, timestamps, statuses, and validation results.
+- **Deletion:** Delete logs only after the retention period and only when they are no longer needed for troubleshooting, auditing, or recovery. An authorized ETL or database administrator performs and records deletion.
+- **Audit records:** Apply any longer organizational retention requirement to audit records separately from operational logs.
 
 ## 6. Extraction Data Contract and Naming Convention
 
-The extraction data contract defines the expected structure of the data handed to the next ETL stage.
+### Required schema
 
-### Expected Source Tables
+The output contains the selected columns listed in Section 2. Preserve source identifiers, relationships, data types, values, and NULLs. Each table remains a separate dataset in its original row grain.
 
-The extraction package contains five separate datasets:
+### Naming convention
 
-- `branches`
-- `customers`
-- `orders`
-- `payments`
-- `expenses`
+- Preserve lowercase `snake_case` source table and column names.
+- Keep primary keys named `id` and preserve foreign-key names such as `branch_id`, `customer_id`, and `order_id`.
+- Preserve UUID and exact `NUMERIC` values, dates, timestamps, text, and NULLs.
 
-### Naming Convention
+### Source-to-extract mapping
 
-The following naming conventions are used:
+Stage 1 does not standardize field names. Each selected column maps to an identically named output column with its source type and value.
 
-- Lowercase `snake_case` for table and column names
-- Clear and consistent names
-- No unnecessary abbreviations
-- Primary keys use `id`
-- Foreign keys use the related table name followed by `_id`, such as `branch_id`, `customer_id`, and `order_id`
+| Source column           | Output column  | Source type        | Target type        | Mapping type |
+| ----------------------- | -------------- | ------------------ | ------------------ | ------------ |
+| `orders.created_at`     | `created_at`   | `TIMESTAMPTZ NULL` | `TIMESTAMPTZ NULL` | Preserve     |
+| `payments.amount`       | `amount`       | `NUMERIC`          | `NUMERIC`          | Preserve     |
+| `expenses.expense_date` | `expense_date` | `DATE`             | `DATE`             | Preserve     |
 
-### Data Types
+### Schema consistency
 
-Source data types are preserved during extraction.
-
-- Identifiers use UUID
-- Monetary and measurement values use NUMERIC
-- Date values use DATE
-- Date and time values use TIMESTAMPTZ
-- Text values use TEXT
-
-NULL values are preserved and are not automatically replaced with empty values or default values.
-
-### Schema Consistency
-
-The source schema is checked against the expected extraction contract before processing.
-
-If a required table or column is missing, renamed, or has an incompatible data type, the extraction is stopped for review.
-
-No data type conversion or default value is applied without confirmation.
-
-Changes to the source schema are documented and reviewed before the extraction contract is updated.
-
-### Source-to-Standardized Mapping
-
-The extracted column names remain consistent with the source fields. The extraction does not perform business transformations or standardization.
-
----
+Check required tables, columns, data types, and identifiers before extraction. Stop the run if a required field is missing, renamed, or incompatible. Review schema changes before updating this contract.
 
 ## 7. Extraction Acceptance and Handover Rules
 
-The extraction result is evaluated based on the validation results.
+| Validation condition         | Acceptance criteria                                                                                         | Pipeline action                                                                                           | Decision / responsible role                        |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| All critical checks pass     | Required tables and columns exist; identifiers, uniqueness, row counts, snapshot, and output checks pass.   | Mark `APPROVED` and continue to Transformation.                                                           | Automatic.                                         |
+| Non-critical warnings remain | Nullable dates or references are reported, but extraction is complete.                                      | Hold for review; preserve the data unchanged.                                                             | `MANUAL REVIEW` by an ETL operator or data owner.  |
+| A critical check fails       | Required source data is unavailable, identifiers are invalid, counts mismatch, or extraction is incomplete. | Mark `REJECTED`; stop handover and quarantine partial output. Retry transient failures with a new run ID. | Automatic stop; ETL operator resolves the failure. |
 
-| Validation Condition        | Acceptance Criteria                                                                                                                    | Pipeline Action                                   | Decision      |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------- |
-| All critical checks pass    | Required tables and columns exist, records are complete, IDs are valid, and extraction is complete                                     | Prepare the extraction package for the next stage | APPROVED      |
-| Non-critical warnings occur | Data is extracted but warnings such as nullable dates or unusual record counts are present                                             | Record the warnings and require review            | MANUAL REVIEW |
-| Critical validation fails   | Required source data is unavailable, required fields are missing, IDs are duplicated, counts do not match, or extraction is incomplete | Stop the handover and resolve the issue           | REJECTED      |
+### Handover
 
-### Handover Output
-
-The extraction package contains:
-
-1. Extracted `branches` dataset
-2. Extracted `customers` dataset
-3. Extracted `orders` dataset
-4. Extracted `payments` dataset
-5. Extracted `expenses` dataset
-6. Extraction manifest
-7. Validation results
-8. Pipeline run metadata
-9. Acceptance decision
-
-The package is handed over to the Transformation Stage only after the required extraction checks have been completed.
-
----
+Pass the five staged datasets, run metadata, validation results, errors, and acceptance status to Transformation. The next stage acknowledges the run ID and status. Cleaning, standardization, filtering, and business calculations are not part of this extraction stage.
 
 ## 8. Common Extraction Problems and Mitigation
 
-| Problem                                 | Possible Cause                                                   | Impact                                                        | Mitigation                                                                 |
-| --------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Supabase database is unreachable        | Database or network connection problem                           | Extraction cannot start or complete                           | Check the database connection and retry the extraction                     |
-| Unauthorized database access            | Incorrect credentials or missing read permissions                | Required tables cannot be read                                | Verify the authorized read-only database access                            |
-| Source schema changes                   | Table or column renamed, removed, or changed                     | Extraction may fail or produce an incompatible dataset        | Compare the live schema with the extraction contract and review the change |
-| Extraction is interrupted               | Connection failure or process interruption                       | Output may be incomplete                                      | Mark the run as failed and perform a new extraction                        |
-| Record count mismatch                   | Records were added, changed, or missed during extraction         | Extracted dataset may not represent the complete source       | Compare source and extracted record counts and review the extraction run   |
-| Duplicate or missing IDs                | Source data integrity problem                                    | Records may not be uniquely identifiable                      | Record the validation failure and stop the handover when critical          |
-| Missing or unmatched references         | Invalid branch, customer, or order references                    | Relationships may not be reliable                             | Record the issue for review without modifying the extracted source data    |
-| Missing dates                           | Source date fields contain NULL values                           | Some records may not be usable for later date-based reporting | Preserve the records and record the condition as a validation warning      |
-| Late payments or historical corrections | Source records are updated after their original transaction date | Previous reporting periods may change                         | Use full-history extraction so updated records are included                |
-| Data serialization problem              | Source values cannot be represented correctly in the output      | Extracted dataset may be incomplete or corrupted              | Validate data types and output serialization before handover               |
-| Incorrect schedule time                 | Time zone or scheduling configuration is incorrect               | Extraction may run at the wrong time                          | Verify the schedule uses Asia/Manila time                                  |
-| Increasing extraction volume            | Full-history extraction grows as more records are added          | Extraction may take longer over time                          | Monitor extraction duration and record counts                              |
-
----
+| Problem                               | Possible cause                                           | Impact                                                | Proposed mitigation                                                          |
+| ------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Database connection failure           | Network or database outage                               | Extraction cannot complete.                           | Retry transient failures; stop and report persistent failures.               |
+| Read permission failure               | Invalid credentials or changed grants                    | One or more tables cannot be extracted.               | Verify read access for each required table.                                  |
+| Schema change                         | Required table or column is renamed, removed, or changed | Query fails or output no longer matches the contract. | Stop extraction, review the change, and update the contract before retrying. |
+| Interrupted extraction                | Worker, connection, or output failure                    | Partial datasets may be handed over accidentally.     | Mark the run failed, quarantine partial output, and retry with a new run ID. |
+| Source/output count mismatch          | Truncated read or write                                  | Records may be missing or duplicated.                 | Compare counts per table; reject mismatched output.                          |
+| Missing or duplicate identifiers      | Source integrity or extraction error                     | Records cannot be reliably identified or related.     | Record the affected table and stop acceptance until resolved.                |
+| Late payment or historical correction | A source record changes after an earlier run             | Previous reporting periods may change.                | Re-extract full history on the next run.                                     |
+| Incorrect schedule timezone           | Scheduler is not set to Asia/Manila or UTC equivalent    | Extraction runs at the wrong time.                    | Verify the scheduler timezone and cron setting.                              |
 
 ## Expected Output
 
-The completed Stage 1 extraction produces five raw datasets from the I&C Laundry PostgreSQL database:
-
-- `branches`
-- `customers`
-- `orders`
-- `payments`
-- `expenses`
-
-The extraction package also includes the extraction manifest, run metadata, validation results, and acceptance decision.
-
-The extracted data preserves the source values, data types, NULL values, and original row-level structure.
-
-The output is validated and packaged for the Transformation Stage.
-
-Cleaning, standardization, business filtering, and reporting calculations are not performed during this extraction stage.
+Five extracted datasets in transaction-local staging, together with the run metadata, validation results, and acceptance status required for handover to Transformation.
