@@ -174,6 +174,8 @@ Handover must provide the five temporary stages, run ID, run timestamp, metadata
 
 A standalone extraction check through Python may display counts and validation results, then close the connection and remove temporary tables. This check is not a handover. Handover must occur while the temporary stages are still available. Cleaning, standardization, and business transformations are outside this stage.
 
+Scheduled handover uses an optional receiver configured by the database administrator in `etl_ops.extraction_handover`. The receiver provides two SQL functions accepting and returning JSONB: acknowledgment of the run ID and acceptance status, followed by consumption of the full metadata and staging references. Both functions must use invoker permissions and execute within the extraction transaction. Invalid acknowledgment blocks consumption and rejects the run. With no receiver configured, the scheduled run is an extraction check only; its logs must identify handover as `NOT_CONFIGURED`, rather than claim that data was handed over. A real next stage must be configured before end-to-end handover is considered complete.
+
 ## 8. Common Extraction Problems and Mitigation
 
 | Problem | Possible cause | Impact | Mitigation |

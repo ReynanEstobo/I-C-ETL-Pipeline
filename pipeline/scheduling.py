@@ -66,6 +66,20 @@ def check_statement(table, name, status, affected='0'):
     ''').format(sql.Literal(table), sql.Literal(name), sql.SQL(status), sql.SQL(affected))
 
 
+def handover_config_sql(schema='etl_ops'):
+    """No receiver is installed by default; only the owner can configure one."""
+    table = sql.Identifier(schema, 'extraction_handover')
+    return sql.SQL('''
+        CREATE TABLE IF NOT EXISTS {} (
+            singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+            acknowledge_function regprocedure NOT NULL,
+            consume_function regprocedure NOT NULL
+        );
+        REVOKE ALL ON {} FROM PUBLIC;
+        ALTER TABLE {} ENABLE ROW LEVEL SECURITY;
+    ''').format(table, table, table)
+
+
 def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
     """Generate SQL from the extractor's column contract and check queries."""
     stages = []
@@ -126,6 +140,16 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
             failure_message text;
             failure_state text;
             may_retry boolean;
+            acknowledge_function regprocedure;
+            consume_function regprocedure;
+            receiver_schema text;
+            receiver_name text;
+            handover_payload jsonb;
+            acknowledgment jsonb;
+            receiver_result jsonb;
+            table_results jsonb;
+            stage_names jsonb;
+            handover_status text;
             original_isolation text := current_setting('default_transaction_isolation');
             original_read_only text := current_setting('default_transaction_read_only');
         BEGIN
@@ -148,6 +172,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                 failure_state := NULL;
                 may_retry := false;
                 overall := 'PASS';
+                handover_status := 'NOT_ATTEMPTED';
                 {}
 
                 -- The exception subtransaction rolls back staged writes but
@@ -207,7 +232,62 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                         -- as execution failures or retrying data problems.
                         RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'Acceptance blocked';
                     END IF;
-                    -- Extraction-only check: no downstream stage is invoked.
+                    phase := 'handover';
+                    SELECT h.acknowledge_function, h.consume_function
+                    INTO acknowledge_function, consume_function FROM {} h;
+                    IF acknowledge_function IS NULL THEN
+                        handover_status := 'NOT_CONFIGURED';
+                    END IF;
+                    IF acknowledge_function IS NOT NULL THEN
+                        -- Hooks run in this snapshot; they cannot commit and
+                        -- cannot write to permanent tables in read-only mode.
+                        handover_status := 'FAILED';
+                        failure_code := 'HANDOVER_FAILED';
+                        SELECT jsonb_object_agg(key, 'pg_temp.stage_' || key)
+                            INTO stage_names FROM jsonb_each(expected);
+                        SELECT jsonb_object_agg(key, 'PASS')
+                            INTO table_results FROM jsonb_each(expected);
+                        handover_payload := jsonb_build_object(
+                            'pipeline_run_id', run_id, 'acceptance_status', 'APPROVED',
+                            'extraction_status', overall, 'extraction_started_at', started,
+                            'extraction_ended_at', clock_timestamp(),
+                            'duration_ms', floor(extract(epoch FROM clock_timestamp()-started)*1000)::bigint,
+                            'records_read', source_counts, 'records_extracted', staged_counts,
+                            'records_rejected', (SELECT jsonb_object_agg(key, 0) FROM jsonb_each(expected)),
+                            'extraction_window', 'All available history', 'stages', stage_names,
+                            'validation_results', jsonb_build_object('status', overall,
+                                'tables', table_results, 'checks', checks),
+                            'error_code', NULL, 'error_message', NULL);
+                        FOR receiver IN 1..2 LOOP
+                            SELECT ns.nspname, p.proname INTO receiver_schema, receiver_name
+                            FROM pg_catalog.pg_proc p
+                            JOIN pg_catalog.pg_namespace ns ON ns.oid = p.pronamespace
+                            WHERE p.oid = CASE receiver WHEN 1 THEN acknowledge_function::oid
+                                                       ELSE consume_function::oid END
+                              AND p.prokind = 'f' AND p.pronargs = 1
+                              AND p.proargtypes[0] = 'jsonb'::regtype
+                              AND p.prorettype = 'jsonb'::regtype
+                              AND NOT p.prosecdef;
+                            IF receiver_name IS NULL THEN
+                                RAISE EXCEPTION 'Handover requires invoker functions accepting and returning JSONB';
+                            END IF;
+                            IF receiver = 1 THEN
+                                EXECUTE format('SELECT %I.%I($1)', receiver_schema, receiver_name)
+                                    INTO acknowledgment USING jsonb_build_object(
+                                        'pipeline_run_id', run_id, 'acceptance_status', 'APPROVED');
+                                IF acknowledgment->>'pipeline_run_id' IS DISTINCT FROM run_id::text
+                                   OR acknowledgment->>'acceptance_status' IS DISTINCT FROM 'APPROVED' THEN
+                                    RAISE EXCEPTION 'Next stage did not acknowledge the approved run';
+                                END IF;
+                            ELSE
+                                EXECUTE format('SELECT %I.%I($1)', receiver_schema, receiver_name)
+                                    INTO receiver_result USING handover_payload;
+                            END IF;
+                        END LOOP;
+                        handover_status := 'ACKNOWLEDGED';
+                        failure_code := NULL;
+                        {}
+                    END IF;
                 EXCEPTION WHEN OTHERS THEN
                     GET STACKED DIAGNOSTICS failure_state = RETURNED_SQLSTATE;
                     IF failure_state = 'P0002' AND overall <> 'PASS' THEN
@@ -231,8 +311,8 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                             checks := checks || jsonb_build_array(jsonb_build_object(
                                 'table','*','check','completion','status','FAIL','affected_rows',1));
                         END IF;
-                        may_retry := failure_state LIKE '08%%'
-                            OR failure_state IN ('40001','40P01','53300','57P01','57P02','57P03');
+                        may_retry := phase <> 'handover' AND (failure_state LIKE '08%%'
+                            OR failure_state IN ('40001','40P01','53300','57P01','57P02','57P03'));
                     END IF;
                 END;
                 ended := clock_timestamp();
@@ -258,7 +338,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                         run_id, {} || '.' || table_entry.key, started, ended, table_status,
                         (source_counts->>table_entry.key)::bigint,
                         (staged_counts->>table_entry.key)::bigint, 0, 'All available history',
-                        jsonb_build_object('overall_status', overall, 'checks',
+                        jsonb_build_object('overall_status', overall, 'handover_status', handover_status, 'checks',
                             (SELECT coalesce(jsonb_agg(c), '[]'::jsonb)
                              FROM jsonb_array_elements(checks) c
                              WHERE c->>'table' IN (table_entry.key, '*'))),
@@ -301,6 +381,8 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
         check_statement('*', 'source_accessibility', "'PASS'"),
         sql.SQL('\n').join(reads), sql.SQL('\n').join(validations),
         check_statement('*', 'completion', "'PASS'"),
+        sql.Identifier(procedure_schema, 'extraction_handover'),
+        check_statement('*', 'handover', "'PASS'"),
         sql.Literal(source_schema),
         sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
     )
@@ -335,6 +417,7 @@ def test_scheduled_extraction():
                     )
                     cursor.execute(sql.SQL('CREATE TABLE {} ({})').format(
                         sql.Identifier(test_schema, table), definitions))
+                cursor.execute(handover_config_sql(test_schema))
                 cursor.execute(procedure_sql(test_schema, test_schema))
             connection.commit()
             connection.autocommit = True
@@ -416,6 +499,61 @@ def test_scheduled_extraction():
                 holder.execute('SELECT pg_advisory_xact_lock(%s, %s)', EXTRACTION_LOCK_KEY)
                 run_case('Overlapping run', 'REJECTED', 'EXTRACTION_ALREADY_RUNNING', 'overlap_lock')
             run_case('Lock released', 'APPROVED')
+            # Test-only receiver reads counts and records call order in a temp
+            # table. It performs no transformation or permanent writes.
+            connection.execute('CREATE TEMP TABLE handover_events (event text)')
+            connection.execute(sql.SQL('''
+                CREATE FUNCTION {}(metadata jsonb) RETURNS jsonb
+                LANGUAGE plpgsql SECURITY INVOKER AS $ack$
+                BEGIN
+                    INSERT INTO pg_temp.handover_events VALUES ('acknowledge');
+                    RETURN metadata;
+                END; $ack$;
+                CREATE FUNCTION {}(payload jsonb) RETURNS jsonb
+                LANGUAGE plpgsql SECURITY INVOKER AS $consume$
+                DECLARE item record; actual bigint;
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_temp.handover_events
+                                   WHERE event = 'acknowledge') THEN
+                        RAISE EXCEPTION 'Consumption preceded acknowledgment';
+                    END IF;
+                    IF NOT (payload ?& ARRAY['records_read','records_extracted',
+                        'records_rejected','duration_ms','extraction_started_at',
+                        'extraction_ended_at','validation_results','stages']) THEN
+                        RAISE EXCEPTION 'Incomplete handover metadata';
+                    END IF;
+                    FOR item IN SELECT * FROM jsonb_each_text(payload->'stages') LOOP
+                        EXECUTE format('SELECT count(*) FROM pg_temp.%I', 'stage_' || item.key)
+                            INTO actual;
+                        IF actual IS DISTINCT FROM (payload->'records_extracted'->>item.key)::bigint THEN
+                            RAISE EXCEPTION 'Staging count mismatch';
+                        END IF;
+                    END LOOP;
+                    INSERT INTO pg_temp.handover_events VALUES ('consume');
+                    RETURN jsonb_build_object('consumed', true);
+                END; $consume$;
+                INSERT INTO {} (acknowledge_function, consume_function)
+                    VALUES ({}::regprocedure, {}::regprocedure);
+            ''').format(
+                sql.Identifier(test_schema, 'acknowledge'), sql.Identifier(test_schema, 'consume'),
+                sql.Identifier(test_schema, 'extraction_handover'),
+                sql.Literal(test_schema + '.acknowledge(jsonb)'),
+                sql.Literal(test_schema + '.consume(jsonb)'),
+            ))
+            run_case('Acknowledgment before staging consumption', 'APPROVED')
+            assert connection.execute('SELECT event FROM pg_temp.handover_events ORDER BY ctid').fetchall() == [
+                ('acknowledge',), ('consume',)]
+            connection.execute('DELETE FROM pg_temp.handover_events')
+            connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
+                sql.Identifier(test_schema, 'orders')))
+            run_case('Warning blocks receiver', 'MANUAL REVIEW', expected_check='branch_id_present')
+            assert connection.execute('SELECT count(*) FROM pg_temp.handover_events').fetchone()[0] == 0
+            reset_fixtures()
+            connection.execute(sql.SQL('''CREATE OR REPLACE FUNCTION {}(metadata jsonb)
+                RETURNS jsonb LANGUAGE sql SECURITY INVOKER AS $bad$
+                SELECT '{{}}'::jsonb; $bad$;''').format(sql.Identifier(test_schema, 'acknowledge')))
+            run_case('Invalid acknowledgment blocks consumption', 'REJECTED', 'HANDOVER_FAILED', 'handover')
+            assert connection.execute('SELECT count(*) FROM pg_temp.handover_events').fetchone()[0] == 0
             print('All scheduled extraction tests passed. Synthetic test logs are retained.')
         finally:
             if not connection.closed:
@@ -517,6 +655,7 @@ def manage_schedule(action):
         if action == 'update':
             with connection.cursor() as cursor:
                 cursor.execute(log_recovery_sql())
+                cursor.execute(handover_config_sql())
                 cursor.execute(procedure_sql())
             print('Database procedure updated. Cron schedule and active status were unchanged.')
             return
@@ -532,6 +671,7 @@ def manage_schedule(action):
             expression = cron_expression(connection)
             if action == 'setup':
                 cursor.execute(log_recovery_sql())
+                cursor.execute(handover_config_sql())
                 cursor.execute(procedure_sql())
                 cursor.execute('SELECT cron.schedule(%s, %s, %s)',
                                (JOB_NAME, expression, JOB_COMMAND))
