@@ -1,9 +1,14 @@
 """Read the five source datasets specified in extraction.md (issue #2)."""
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from time import perf_counter
+from uuid import uuid4
+import sys
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from pipeline.connection import SourceConnectionError, connect_source
 
@@ -75,7 +80,7 @@ def check_source_schema(connection: psycopg.Connection) -> None:
 
 
 @contextmanager
-def extract_source():
+def extract_source(source_counts=None, staged_counts=None):
     """Stage source rows in SQL and yield the connection and row counts.
 
     Stages remain available inside this context only. Future SQL validation
@@ -115,6 +120,13 @@ def extract_source():
                 for table, columns in SOURCE_COLUMNS.items():
                     try:
                         with connection.cursor() as cursor:
+                            cursor.execute(sql.SQL('SELECT count(*) FROM {}').format(
+                                sql.Identifier('public', table)
+                            ))
+                            if source_counts is not None:
+                                source_counts[table] = cursor.fetchone()[0]
+                            else:
+                                cursor.fetchone()
                             selected = sql.SQL(', ').join(map(sql.Identifier, columns))
                             cursor.execute(
                                 sql.SQL('INSERT INTO {} ({}) SELECT {} FROM {}').format(
@@ -126,6 +138,8 @@ def extract_source():
                                 sql.Identifier('pg_temp', 'stage_' + table)
                             ))
                             counts[table] = cursor.fetchone()[0]
+                            if staged_counts is not None:
+                                staged_counts[table] = counts[table]
                     except psycopg.Error:
                         raise ExtractionError(
                             f'Could not stage public.{table}. '
@@ -220,9 +234,107 @@ def validate_staged_data(
     return {'status': overall, 'tables': tables, 'checks': checks}
 
 
+def setup_extraction_logs():
+    """One-time administrator setup; no access is granted to browser roles."""
+    with connect_source() as connection:
+        connection.read_only = False
+        with connection.cursor() as cursor:
+            cursor.execute('''
+                CREATE SCHEMA IF NOT EXISTS etl_ops;
+                REVOKE ALL ON SCHEMA etl_ops FROM PUBLIC;
+                CREATE TABLE IF NOT EXISTS etl_ops.extraction_logs (
+                    pipeline_run_id UUID NOT NULL,
+                    table_name TEXT NOT NULL,
+                    extraction_started_at TIMESTAMPTZ NOT NULL,
+                    extraction_ended_at TIMESTAMPTZ NOT NULL,
+                    extraction_status TEXT NOT NULL
+                        CHECK (extraction_status IN ('PASS', 'WARNING', 'FAIL')),
+                    records_read BIGINT CHECK (records_read >= 0),
+                    records_extracted BIGINT CHECK (records_extracted >= 0),
+                    records_rejected BIGINT NOT NULL DEFAULT 0,
+                    extraction_window TEXT NOT NULL,
+                    validation_results JSONB NOT NULL,
+                    error_code TEXT,
+                    error_message TEXT,
+                    duration_ms BIGINT NOT NULL CHECK (duration_ms >= 0),
+                    acceptance_status TEXT,
+                    PRIMARY KEY (pipeline_run_id, table_name)
+                );
+                REVOKE ALL ON etl_ops.extraction_logs FROM PUBLIC;
+                ALTER TABLE etl_ops.extraction_logs ENABLE ROW LEVEL SECURITY;
+                CREATE OR REPLACE FUNCTION etl_ops.protect_extraction_logs()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF TG_OP <> 'DELETE' THEN
+                        RAISE EXCEPTION 'Extraction logs cannot be updated or truncated';
+                    END IF;
+                    IF OLD.extraction_ended_at > now() - interval '1 year' THEN
+                        RAISE EXCEPTION 'Extraction logs must be retained for at least one year';
+                    END IF;
+                    RETURN OLD;
+                END;
+                $$;
+                REVOKE ALL ON FUNCTION etl_ops.protect_extraction_logs() FROM PUBLIC;
+                DROP TRIGGER IF EXISTS protect_extraction_logs ON etl_ops.extraction_logs;
+                CREATE TRIGGER protect_extraction_logs
+                    BEFORE UPDATE OR DELETE ON etl_ops.extraction_logs
+                    FOR EACH ROW EXECUTE FUNCTION etl_ops.protect_extraction_logs();
+                DROP TRIGGER IF EXISTS prevent_log_truncate ON etl_ops.extraction_logs;
+                CREATE TRIGGER prevent_log_truncate
+                    BEFORE TRUNCATE ON etl_ops.extraction_logs
+                    FOR EACH STATEMENT EXECUTE FUNCTION etl_ops.protect_extraction_logs();
+            ''')
+
+
+def save_extraction_logs(run_id, started, ended, duration, source_counts,
+                         staged_counts, results, error_code=None, error_message=None):
+    """Commit only metadata on a separate connection after extraction ends."""
+    with connect_source() as connection:
+        connection.read_only = False
+        with connection.cursor() as cursor:
+            for table in SOURCE_COLUMNS:
+                status = (results['tables'][table] if results.get('tables')
+                          else 'FAIL')
+                details = {
+                    'overall_status': 'FAIL' if error_code else results['status'],
+                    'checks': [check for check in results.get('checks', [])
+                               if check['table'] == table],
+                }
+                cursor.execute('''
+                    INSERT INTO etl_ops.extraction_logs (
+                        pipeline_run_id, table_name, extraction_started_at,
+                        extraction_ended_at, extraction_status, records_read,
+                        records_extracted, records_rejected, extraction_window,
+                        validation_results, error_code, error_message, duration_ms
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                ''', (run_id, 'public.' + table, started, ended, status,
+                      source_counts.get(table), staged_counts.get(table),
+                      'All available history', Jsonb(details), error_code,
+                      error_message, duration))
+
+
 def main() -> int:
+    if sys.argv[1:] == ['--setup-logs']:
+        try:
+            setup_extraction_logs()
+        except (psycopg.Error, SourceConnectionError):
+            print('Log setup failed. Check database access and administrator permissions.')
+            return 1
+        print('Restricted extraction log table created: etl_ops.extraction_logs.')
+        print('Only its owner has access by default. Retention is at least one year.')
+        return 0
+    if sys.argv[1:]:
+        print('Usage: python -m pipeline.extraction [--setup-logs]')
+        return 1
+    run_id = uuid4()
+    started = datetime.now(timezone.utc)
+    timer = perf_counter()
+    source_counts, staged_counts = {}, {}
+    results = {}
+    error_code = error_message = None
+    print(f'Run ID: {run_id}')
     try:
-        with extract_source() as (connection, counts):
+        with extract_source(source_counts, staged_counts) as (connection, counts):
             print('Extraction completed from one read-only snapshot.')
             for table, count in counts.items():
                 print(f'stage_{table}: {count} rows')
@@ -237,8 +349,26 @@ def main() -> int:
         print('Connection closed. Temporary staging tables were removed.')
     except (ExtractionError, SourceConnectionError) as error:
         print(error)
+        error_code = ('SOURCE_CONNECTION_FAILED' if isinstance(error, SourceConnectionError)
+                      else 'EXTRACTION_FAILED')
+        # Store fixed messages rather than raw database errors or credentials.
+        error_message = ('Source connection failed.' if isinstance(error, SourceConnectionError)
+                         else 'Extraction or SQL validation could not complete.')
+    ended = datetime.now(timezone.utc)
+    duration = int((perf_counter() - timer) * 1000)
+    if not error_code and results.get('status') == 'FAIL':
+        error_code = 'VALIDATION_FAILED'
+        error_message = 'One or more extraction validation checks failed.'
+    try:
+        save_extraction_logs(run_id, started, ended, duration, source_counts,
+                             staged_counts, results, error_code, error_message)
+    except (psycopg.Error, SourceConnectionError):
+        print('Could not save extraction logs. The run is not fully logged.')
+        print('Check log setup, permissions, and database connectivity before retrying.')
+        print(f'Run ID: {run_id}; start: {started.isoformat()}; end: {ended.isoformat()}')
         return 1
-    return 1 if results['status'] == 'FAIL' else 0
+    print(f'Run details saved in etl_ops.extraction_logs ({duration} ms).')
+    return 1 if error_code else 0
 
 
 if __name__ == '__main__':
