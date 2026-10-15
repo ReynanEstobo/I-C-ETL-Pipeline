@@ -2,6 +2,8 @@
 
 import json
 import sys
+from datetime import datetime, timezone
+from uuid import uuid4
 
 import psycopg
 from psycopg import sql
@@ -23,7 +25,7 @@ def check_statement(table, name, status, affected='0'):
     ''').format(sql.Literal(table), sql.Literal(name), sql.SQL(status), sql.SQL(affected))
 
 
-def procedure_sql():
+def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
     """Generate SQL from the extractor's column contract and check queries."""
     stages = []
     reads = []
@@ -43,14 +45,14 @@ def procedure_sql():
             SELECT count(*) INTO n FROM {};
             staged_counts := staged_counts || jsonb_build_object({}, n);
         ''').format(
-            sql.Identifier('public', table), sql.Literal(table),
+            sql.Identifier(source_schema, table), sql.Literal(table),
             sql.Identifier('pg_temp', 'stage_' + table), selected, selected,
-            sql.Identifier('public', table),
+            sql.Identifier(source_schema, table),
             sql.Identifier('pg_temp', 'stage_' + table), sql.Literal(table),
         ))
 
     validations = []
-    for table, name, query, warning in validation_queries():
+    for table, name, query, warning in validation_queries(source_schema):
         validations.append(sql.SQL('{} INTO affected;').format(query))
         status = "CASE WHEN affected = 0 THEN 'PASS' ELSE '{}' END".format(
             'WARNING' if warning else 'FAIL'
@@ -60,7 +62,7 @@ def procedure_sql():
     # Procedure transaction control requires a top-level CALL. Do not add a
     # SECURITY DEFINER or SET clause: those prohibit COMMIT inside a procedure.
     return sql.SQL('''
-        CREATE OR REPLACE PROCEDURE etl_ops.run_scheduled_extraction()
+        CREATE OR REPLACE PROCEDURE {}()
         LANGUAGE plpgsql SECURITY INVOKER AS $procedure$
         DECLARE
             run_id uuid;
@@ -127,15 +129,15 @@ def procedure_sql():
                         FOR column_entry IN SELECT * FROM jsonb_each_text(table_entry.value) LOOP
                             SELECT udt_name INTO actual_type
                             FROM information_schema.columns
-                            WHERE table_schema = 'public'
+                            WHERE table_schema = {}
                               AND table_name = table_entry.key
                               AND column_name = column_entry.key;
                             IF actual_type IS DISTINCT FROM column_entry.value THEN
                                 failure_code := 'SCHEMA_MISMATCH';
                                 RAISE EXCEPTION 'Source schema does not match extraction contract';
                             END IF;
-                            EXECUTE format('SELECT %I FROM public.%I LIMIT 0',
-                                           column_entry.key, table_entry.key);
+                            EXECUTE format('SELECT %I FROM %I.%I LIMIT 0',
+                                           column_entry.key, {}, table_entry.key);
                         END LOOP;
                     END LOOP;
                     {}
@@ -201,7 +203,7 @@ def procedure_sql():
                         extraction_window, validation_results, error_code, error_message,
                         duration_ms, acceptance_status
                     ) VALUES (
-                        run_id, 'public.' || table_entry.key, started, ended, table_status,
+                        run_id, {} || '.' || table_entry.key, started, ended, table_status,
                         (source_counts->>table_entry.key)::bigint,
                         (staged_counts->>table_entry.key)::bigint, 0, 'All available history',
                         jsonb_build_object('overall_status', overall, 'checks',
@@ -229,17 +231,21 @@ def procedure_sql():
             END LOOP;
         END;
         $procedure$;
-        REVOKE ALL ON PROCEDURE etl_ops.run_scheduled_extraction() FROM PUBLIC;
+        REVOKE ALL ON PROCEDURE {}() FROM PUBLIC;
     ''').format(
+        sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
         sql.Literal(json.dumps(SOURCE_COLUMNS)),
         sql.SQL('\n').join(stages),
         check_statement('*', 'source_accessibility', "'PASS'"),
         sql.Literal(EXTRACTION_LOCK_KEY[0]), sql.Literal(EXTRACTION_LOCK_KEY[1]),
         check_statement('*', 'overlap_lock', "'PASS'"),
         check_statement('*', 'snapshot_consistency', "'PASS'"),
+        sql.Literal(source_schema), sql.Literal(source_schema),
         check_statement('*', 'schema_compatibility', "'PASS'"),
         sql.SQL('\n').join(reads), sql.SQL('\n').join(validations),
         check_statement('*', 'completion', "'PASS'"),
+        sql.Literal(source_schema),
+        sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
     )
 
 
@@ -254,7 +260,122 @@ def cron_expression(connection):
     raise ValueError('Unsupported cron.timezone; verify scheduler timezone before setup.')
 
 
+def test_scheduled_extraction():
+    """Exercise the production SQL generator with isolated synthetic sources."""
+    test_schema = 'etl_test_' + uuid4().hex
+    print(f'Isolated test schema: {test_schema}')
+    with connect_source() as connection:
+        connection.read_only = False
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(test_schema)))
+                cursor.execute(sql.SQL('REVOKE ALL ON SCHEMA {} FROM PUBLIC').format(
+                    sql.Identifier(test_schema)))
+                for table, columns in SOURCE_COLUMNS.items():
+                    definitions = sql.SQL(', ').join(
+                        sql.SQL('{} {}').format(sql.Identifier(column), sql.SQL(kind))
+                        for column, kind in columns.items()
+                    )
+                    cursor.execute(sql.SQL('CREATE TABLE {} ({})').format(
+                        sql.Identifier(test_schema, table), definitions))
+                cursor.execute(procedure_sql(test_schema, test_schema))
+            connection.commit()
+            connection.autocommit = True
+            # Direct fixture writes need writable autocommit transactions.
+            connection.execute('SET default_transaction_read_only = off')
+            branch, customer, order, payment, expense = [uuid4() for _ in range(5)]
+            now = datetime.now(timezone.utc)
+            fixtures = {
+                'branches': [branch, 'Test branch', None, None],
+                'customers': [customer],
+                'orders': [order, 'TEST-001', branch, customer, now, 'received', 8, 200],
+                'payments': [payment, order, branch, 100, now, 'test'],
+                'expenses': [expense, branch, 50, now.date(), None],
+            }
+
+            def reset_fixtures():
+                for table, values in fixtures.items():
+                    connection.execute(sql.SQL('DELETE FROM {}').format(
+                        sql.Identifier(test_schema, table)))
+                    connection.execute(sql.SQL('INSERT INTO {} VALUES ({})').format(
+                        sql.Identifier(test_schema, table),
+                        sql.SQL(', ').join(sql.Placeholder() for _ in values)), values)
+
+            def run_case(label, expected, expected_error=None, expected_check=None):
+                try:
+                    connection.execute(sql.SQL('CALL {}()').format(
+                        sql.Identifier(test_schema, 'run_scheduled_extraction')))
+                    assert expected != 'REJECTED', f'{label}: expected rejection'
+                except psycopg.Error as error:
+                    if not (expected == 'REJECTED' and error.sqlstate == 'P0001'
+                            and error.diag.message_primary.startswith('Scheduled extraction rejected')):
+                        raise
+                rows = connection.execute('''
+                    SELECT pipeline_run_id, table_name, extraction_status,
+                           acceptance_status, error_code, records_read,
+                           records_extracted, validation_results
+                    FROM etl_ops.extraction_logs
+                    WHERE pipeline_run_id = (
+                        SELECT pipeline_run_id FROM etl_ops.extraction_logs
+                        WHERE split_part(table_name, '.', 1) = %s
+                        ORDER BY extraction_started_at DESC LIMIT 1)
+                ''', (test_schema,)).fetchall()
+                assert len(rows) == 5, f'{label}: missing table logs'
+                assert all(row[3] == expected for row in rows), f'{label}: acceptance mismatch'
+                assert all(row[4] == expected_error for row in rows), f'{label}: error code mismatch'
+                if expected_check:
+                    assert any(check['check'] == expected_check and check['status'] != 'PASS'
+                               for row in rows for check in row[7]['checks']), label
+                if expected_error == 'EXTRACTION_ALREADY_RUNNING':
+                    assert all(row[5] is None and row[6] is None for row in rows)
+                # COMMIT clears successful stages; rejected/held stages roll back.
+                for table in SOURCE_COLUMNS:
+                    count = connection.execute(sql.SQL('SELECT count(*) FROM {}').format(
+                        sql.Identifier('pg_temp', 'stage_' + table))).fetchone()[0]
+                    assert count == 0, f'{label}: staging was not cleared'
+                    connection.execute(sql.SQL('DROP TABLE {}').format(
+                        sql.Identifier('pg_temp', 'stage_' + table)))
+                print(f'PASS: {label} ({rows[0][0]})')
+
+            reset_fixtures()
+            run_case('Valid populated records', 'APPROVED')
+            connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
+                sql.Identifier(test_schema, 'orders')))
+            run_case('Nullable branch warning', 'MANUAL REVIEW', expected_check='branch_id_present')
+            reset_fixtures()
+            connection.execute(sql.SQL('UPDATE {} SET paid_at = NULL').format(
+                sql.Identifier(test_schema, 'payments')))
+            run_case('Missing required date', 'REJECTED', 'VALIDATION_FAILED', 'paid_at_present')
+            reset_fixtures()
+            connection.execute(sql.SQL('UPDATE {} SET customer_id = %s').format(
+                sql.Identifier(test_schema, 'orders')), (uuid4(),))
+            run_case('Broken customer reference', 'REJECTED', 'VALIDATION_FAILED', 'customer_id_reference')
+            reset_fixtures()
+            connection.execute(sql.SQL('INSERT INTO {} SELECT * FROM {}').format(
+                sql.Identifier(test_schema, 'orders'), sql.Identifier(test_schema, 'orders')))
+            run_case('Duplicate identifiers', 'REJECTED', 'VALIDATION_FAILED', 'id_unique')
+            reset_fixtures()
+            with connect_source() as holder:
+                holder.execute('SELECT pg_advisory_xact_lock(%s, %s)', EXTRACTION_LOCK_KEY)
+                run_case('Overlapping run', 'REJECTED', 'EXTRACTION_ALREADY_RUNNING', 'overlap_lock')
+            run_case('Lock released', 'APPROVED')
+            print('All scheduled extraction tests passed. Synthetic test logs are retained.')
+        finally:
+            if not connection.closed:
+                connection.rollback()
+                connection.autocommit = True
+                connection.execute('SET default_transaction_read_only = off')
+                # This name is generated locally, not supplied by the user.
+                assert test_schema.startswith('etl_test_') and len(test_schema) == 41
+                connection.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(
+                    sql.Identifier(test_schema)))
+                print('Isolated test schema removed. Operational tables and Cron jobs were unchanged.')
+
+
 def manage_schedule(action):
+    if action == 'test':
+        test_scheduled_extraction()
+        return
     if action == 'setup':
         setup_extraction_logs()
     with connect_source() as connection:
@@ -301,8 +422,8 @@ def manage_schedule(action):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status'):
-        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status')
+    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test'):
+        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test')
         return 1
     try:
         manage_schedule(sys.argv[1])
