@@ -1,8 +1,9 @@
 """Read the five source datasets specified in extraction.md (issue #2)."""
 
+from contextlib import contextmanager
+
 import psycopg
 from psycopg import sql
-from psycopg.rows import dict_row
 
 from pipeline.connection import SourceConnectionError, connect_source
 
@@ -73,61 +74,84 @@ def check_source_schema(connection: psycopg.Connection) -> None:
                 ) from None
 
 
-def extract_source() -> dict[str, list[dict]]:
-    """Return separate, unchanged datasets only after every read succeeds.
+@contextmanager
+def extract_source():
+    """Stage source rows in SQL and yield the connection and row counts.
 
-    Native UUID, Decimal, date, datetime and None values are retained. The
-    caller receives in-memory data; this function does not save output.
+    Stages remain available inside this context only. Future SQL validation
+    must use the yielded connection before leaving this transaction.
     """
     try:
         with connect_source() as connection:
+            # PostgreSQL forbids CREATE TABLE in read-only transactions.
+            # Create empty temporary structures before taking the source snapshot.
+            connection.read_only = False
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    for table, columns in SOURCE_COLUMNS.items():
+                        definitions = sql.SQL(', ').join(
+                            sql.SQL('{} {}').format(sql.Identifier(column), sql.SQL(kind))
+                            for column, kind in columns.items()
+                        )
+                        cursor.execute(
+                            sql.SQL('CREATE TEMP TABLE {} ({}) ON COMMIT DELETE ROWS').format(
+                                sql.Identifier('stage_' + table), definitions
+                            )
+                        )
+
+            connection.read_only = True
             connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             with connection.transaction():
                 with connection.cursor() as cursor:
-                    cursor.execute("SHOW transaction_read_only")
-                    if cursor.fetchone() != ("on",):
-                        raise ExtractionError("Extraction requires a read-only transaction.")
-                    cursor.execute("SHOW transaction_isolation")
-                    if cursor.fetchone() != ("repeatable read",):
-                        raise ExtractionError("Extraction requires a consistent snapshot.")
+                    cursor.execute('SHOW transaction_read_only')
+                    if cursor.fetchone() != ('on',):
+                        raise ExtractionError('Extraction requires a read-only transaction.')
+                    cursor.execute('SHOW transaction_isolation')
+                    if cursor.fetchone() != ('repeatable read',):
+                        raise ExtractionError('Extraction requires a consistent snapshot.')
 
                 check_source_schema(connection)
-                datasets = {}
+                counts = {}
                 for table, columns in SOURCE_COLUMNS.items():
                     try:
-                        with connection.cursor(row_factory=dict_row) as cursor:
+                        with connection.cursor() as cursor:
+                            selected = sql.SQL(', ').join(map(sql.Identifier, columns))
                             cursor.execute(
-                                sql.SQL("SELECT {} FROM {}").format(
-                                    sql.SQL(", ").join(map(sql.Identifier, columns)),
-                                    sql.Identifier("public", table),
+                                sql.SQL('INSERT INTO {} ({}) SELECT {} FROM {}').format(
+                                    sql.Identifier('pg_temp', 'stage_' + table),
+                                    selected, selected, sql.Identifier('public', table),
                                 )
                             )
-                            datasets[table] = cursor.fetchall()
+                            cursor.execute(sql.SQL('SELECT count(*) FROM {}').format(
+                                sql.Identifier('pg_temp', 'stage_' + table)
+                            ))
+                            counts[table] = cursor.fetchone()[0]
                     except psycopg.Error:
                         raise ExtractionError(
-                            f"Could not finish reading public.{table}. "
-                            "No datasets were handed over."
+                            f'Could not stage public.{table}. '
+                            'Extraction was rolled back; source records were unchanged.'
                         ) from None
-        return datasets
+                yield connection, counts
     except psycopg.Error:
         raise ExtractionError(
-            "Extraction failed. Check database access and retry. "
-            "No datasets were handed over."
+            'Extraction failed. Check database access, temporary-table permissions, '
+            'and network connectivity. Source records were unchanged.'
         ) from None
 
 
 def main() -> int:
     try:
-        datasets = extract_source()
+        with extract_source() as (_, counts):
+            print('Extraction completed from one read-only snapshot.')
+            for table, count in counts.items():
+                print(f'stage_{table}: {count} rows')
+            print('Records stayed in PostgreSQL temporary tables; Python read only counts.')
+        print('Connection closed. Temporary staging tables were removed.')
     except (ExtractionError, SourceConnectionError) as error:
         print(error)
         return 1
-    print("Extraction completed from one read-only snapshot.")
-    for table, rows in datasets.items():
-        print(f"{table}: {len(rows)} rows")
-    print("Data was read into memory only; no output files were saved.")
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())
