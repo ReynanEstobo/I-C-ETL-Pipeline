@@ -4,157 +4,166 @@
 
 ### Objective
 
-The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
+Extract the source records needed for daily branch reporting and prepare a traceable, validated dataset for the next pipeline stage. Extraction preserves the original records. Cleaning, standardization, calculations, and loading reporting summaries are outside this stage.
 
 ## 1. Data Source and Extraction Specification
 
-### Source system
+### Source system and database
 
-I&C Laundry's shared operational system records orders, payments, expenses, customers, and branch information for its Main, Calzada, and Nasugbu branches. These records are the source for daily branch reporting.
+I&C Laundry uses a shared operational system for its Main, Calzada, and Nasugbu branches. The source is the existing Supabase PostgreSQL database, with operational and reference tables in the `public` schema.
 
-### Source database
+### Extraction method and tools
 
-- **Database:** I&C Laundry operational database
-- **DBMS:** PostgreSQL
-- **Platform:** Supabase
-- **Schema:** `public`
+Extraction must read full history on each run, with no incremental cursor. SQL must copy the selected source columns into separate temporary staging tables inside the same PostgreSQL database.
 
-### Extraction method
+Python will wrap the SQL extractor using `psycopg`. The wrapper will manage the connection and transaction, execute SQL, and display counts and validation results. Extracted records must remain in PostgreSQL rather than being downloaded into Python memory.
 
-- **Mode:** Full-history extraction of the selected fields on each run; no incremental cursor is used.
-- **Consistency:** Read the source tables in one read-only `REPEATABLE READ` transaction.
-- **Output:** Pass the selected source fields to the following pipeline stage without changing their values or row structure.
+Empty temporary tables are created in a setup transaction. Source reads, staging inserts, and validation then run in one read-only `REPEATABLE READ` transaction. Only temporary staging tables receive extracted records; source tables remain unchanged.
 
-### Extraction technology
+### Schedule
 
-- PostgreSQL / Supabase
-- SQL `SELECT` queries through a read-only PostgreSQL connection
-- Supabase Cron / `pg_cron` for scheduled orchestration
+Extraction must run daily at **01:00 Asia/Manila**, using `0 17 * * *` when the scheduler uses UTC. Supabase Cron / `pg_cron` will schedule the extraction SQL inside PostgreSQL. Python will wrap the SQL for manual execution and testing.
 
-### Extraction schedule
-
-Run daily at **01:00 Asia/Manila**. If the scheduler uses UTC, use `0 17 * * *`.
+Manual and scheduled runs must follow the same extraction scope, snapshot requirements, and validation rules.
 
 ### Extraction scope
 
-Extract selected columns from `public.branches`, `public.customers`, `public.orders`, `public.payments`, and `public.expenses`. Include all available history. Retain cancelled orders, soft-deleted expenses, and NULL values for validation and later-stage handling.
+Extract the columns in Section 2 from `public.branches`, `public.customers`, `public.orders`, `public.payments`, and `public.expenses`. Include all available history, cancelled orders, soft-deleted expenses, and NULL values. Keep each table at its original row grain.
 
-### Source limitations and assumptions
+Do not filter, clean, standardize, or calculate business values during extraction.
 
-- The extraction account must have read access to all five source tables.
-- `orders.created_at` may be NULL. Preserve the row and report the missing date.
-- Branch references may be NULL. Preserve the row and report the missing reference.
-- Payments may be entered after an order is created, and historical records may be corrected. Full-history extraction includes those changes in a later run.
-- Extraction volume grows as source history accumulates.
+### Limitations and assumptions
+
+- The account needs SELECT access to the required source columns and permission to create temporary tables.
+- Required source columns and types must match Section 2. Unexpected changes stop extraction.
+- Nullable dates and references are retained and reported. Warnings require review before handover.
+- Full-history extraction includes late payments and historical corrections on subsequent runs, but its volume grows over time.
+- Temporary stages are available only in the current transaction and connection. They cannot be retained for review after the session closes.
 
 ## 2. Source Tables and Column Specification
 
-| Table              | Purpose            | Selected columns and types                                                                                                                                               | Primary key and relationships                                                                         | Reason for inclusion                                                                  |
-| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `public.branches`  | Branch reference   | `id UUID`; `branch_name TEXT`; `name TEXT NULL`; `code TEXT NULL`                                                                                                        | PK: `id`; referenced by order, payment, and expense branch IDs.                                       | Identifies branches for branch-level reporting.                                       |
-| `public.customers` | Customer reference | `id UUID`                                                                                                                                                                | PK: `id`; referenced by `orders.customer_id`.                                                         | Supports customer activity counts without extracting contact details.                 |
-| `public.orders`    | Order transactions | `id UUID`; `order_number TEXT`; `branch_id UUID NULL`; `customer_id UUID NULL`; `created_at TIMESTAMPTZ NULL`; `status TEXT`; `weight_kg NUMERIC`; `total_price NUMERIC` | PK: `id`; unique: `order_number`; branch and customer IDs reference `branches.id` and `customers.id`. | Supports order counts, statuses, weight, value, and customer activity.                |
-| `public.payments`  | Payment ledger     | `id UUID`; `order_id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `paid_at TIMESTAMPTZ`; `source TEXT`                                                                | PK: `id`; order and branch IDs reference `orders.id` and `branches.id`.                               | Supports payment collection reporting by date and branch.                             |
-| `public.expenses`  | Expense records    | `id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `expense_date DATE`; `deleted_at TIMESTAMPTZ NULL`                                                                   | PK: `id`; branch ID references `branches.id`.                                                         | Supports branch expense reporting; soft-deleted rows are retained for later handling. |
+Columns marked NULL are nullable. Other listed columns are required by the source contract. Source NUMERIC values have no declared precision or scale.
 
-Each extracted row retains the grain of its source table. Do not join orders, payments, and expenses during extraction.
+| Source table | Purpose and reason for inclusion | Selected columns and types | Keys and relationships |
+| --- | --- | --- | --- |
+| `public.branches` | Identifies branches; `branch_name` supplies reporting labels. | `id UUID`; `branch_name TEXT`; `name TEXT NULL`; `code TEXT NULL` | PK: `id`; referenced by order, payment, and expense branch IDs. |
+| `public.customers` | Supports customer activity counts without extracting contact details. | `id UUID` | PK: `id`; referenced by `orders.customer_id`. |
+| `public.orders` | Supplies order activity, statuses, weight, and order value. | `id UUID`; `order_number TEXT`; `branch_id UUID NULL`; `customer_id UUID NULL`; `created_at TIMESTAMPTZ NULL`; `status TEXT`; `weight_kg NUMERIC`; `total_price NUMERIC` | PK: `id`; unique identifier: `order_number`; references `branches.id` and `customers.id`. |
+| `public.payments` | Supplies individual payment collections by date and branch. | `id UUID`; `order_id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `paid_at TIMESTAMPTZ`; `source TEXT` | PK: `id`; references `orders.id` and `branches.id`. One order can have several payments. |
+| `public.expenses` | Supplies branch expenses and deletion status for later filtering. | `id UUID`; `branch_id UUID NULL`; `amount NUMERIC`; `expense_date DATE`; `deleted_at TIMESTAMPTZ NULL` | PK: `id`; references `branches.id`. |
+
+`orders.order_number` is included as an extraction identifier for completeness and uniqueness checks. Orders, payments, and expenses are not joined during extraction.
 
 ## 3. Extraction Validation and Data Quality Checks
 
-| Check name                  | Target                                                           | Purpose                                    | Validation criteria                                                                                                                                          |
-| --------------------------- | ---------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Source connection           | PostgreSQL connection                                            | Confirm source accessibility.              | **PASS:** read-only connection succeeds. **FAIL:** connection or authentication fails.                                                                       |
-| Required tables and columns | Five source tables and selected columns                          | Detect missing or changed schema.          | **PASS:** all required tables and columns exist with compatible types. **FAIL:** a required table or column is missing or incompatible.                      |
-| Required identifiers        | `id` in each table and `orders.order_number`                     | Ensure records can be identified.          | **PASS:** identifiers are present. **FAIL:** a required identifier is NULL.                                                                                  |
-| Key uniqueness              | Table `id` fields and `orders.order_number`                      | Detect duplicate records or order numbers. | **PASS:** all values are unique. **FAIL:** duplicate values are found.                                                                                       |
-| Relationship check          | Branch, customer, and order references                           | Identify unresolved relationships.         | **PASS:** each non-NULL reference matches a key in its source table. **WARNING:** a nullable reference is NULL. **FAIL:** a non-NULL reference has no match. |
-| Record-count completeness   | Source and extracted dataset per table                           | Confirm all snapshot rows were extracted.  | **PASS:** source and output counts match. **FAIL:** counts differ or an output is incomplete.                                                                |
-| Date availability           | `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | Identify dates needed by later reporting.  | **PASS:** required dates are present. **WARNING:** nullable `orders.created_at` is NULL. **FAIL:** a required date is missing or invalid.                    |
-| Extraction interruption     | Run and output datasets                                          | Detect failed or partial runs.             | **PASS:** all reads and writes complete. **FAIL:** a query or output operation fails; do not hand over partial data.                                         |
-| Snapshot consistency        | All five table reads                                             | Ensure reads use one source snapshot.      | **PASS:** all reads use the same `REPEATABLE READ` transaction. **FAIL:** reads use inconsistent snapshots.                                                  |
+SQL must check the staged records inside PostgreSQL. During manual runs, Python must display the returned check results. These checks must report problems without repairing, removing, or standardizing records.
 
-Record validation results for each table and for the overall run. These checks do not clean or transform data.
+| Check | Target | Purpose | Validation criteria |
+| --- | --- | --- | --- |
+| Source accessibility | Connection and selected source columns | Confirm the source can be read. | PASS: connection and SELECT access succeed. FAIL: connection, authentication, or access fails. |
+| Schema compatibility | Five tables and selected columns | Detect missing or changed fields. | PASS: required columns exist with the expected types. FAIL: a field is missing, inaccessible, or incompatible. |
+| Required identifiers | All `id` fields and `orders.order_number` | Identify every record. | PASS: no NULL identifiers. FAIL: any required identifier is NULL. |
+| Uniqueness | All `id` fields and `orders.order_number` | Detect duplicate identifiers. | PASS: no duplicates. FAIL: any non-NULL identifier is repeated. |
+| References | Branch, customer, and order references | Detect unresolved relationships. | PASS: non-NULL references match staged parent IDs. WARNING: a nullable reference is NULL. FAIL: a non-NULL reference has no match, or required `payments.order_id` is NULL. |
+| Date availability and validity | `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | Confirm dates are available for the next stage. | PASS: dates are present and finite. WARNING: nullable `orders.created_at` is NULL. FAIL: a required date is NULL or a date is infinite. PostgreSQL column types reject malformed dates. |
+| Record-count completeness | Source and staged counts for each table | Detect missing or additional staged rows. | PASS: counts match within the same snapshot. FAIL: counts differ. Empty sources with empty stages pass. |
+| Snapshot consistency | All source reads | Prevent mixed source versions. | PASS: reads and checks use one read-only `REPEATABLE READ` transaction. FAIL: required transaction settings are not active. |
+| Completion | Entire extraction run | Prevent partial handover. | PASS: all staging and checks finish. FAIL: a query, connection, or staging operation fails. |
+
+Record per-check, per-table, and overall results. A table fails if any of its checks fail, otherwise it receives WARNING if any check warns, or PASS. The overall result follows the same precedence. Checks must not change the extracted data.
 
 ## 4. Extraction Metadata and Log Specification
 
-| Field                   | Purpose                                             | Example value or format              |
-| ----------------------- | --------------------------------------------------- | ------------------------------------ |
-| `pipeline_run_id`       | Identifies and links one run.                       | UUID, e.g. `7d1e...`                 |
-| `table_name`            | Identifies the extracted table.                     | `public.orders`                      |
-| `extraction_started_at` | Records extraction start time.                      | ISO 8601 timestamp with timezone     |
-| `extraction_ended_at`   | Records extraction end time.                        | ISO 8601 timestamp with timezone     |
-| `extraction_status`     | Records the run result.                             | `PASS`, `WARNING`, or `FAIL`         |
-| `records_read`          | Number of source rows read.                         | Non-negative integer                 |
-| `records_extracted`     | Number of rows written to staging.                  | Non-negative integer                 |
-| `records_rejected`      | Number not passed to the next stage, if applicable. | Non-negative integer; normally `0`   |
-| `extraction_window`     | Identifies the source history included.             | `All available history`              |
-| `validation_results`    | Records validation outcomes.                        | JSON, e.g. `{"orders_count":"PASS"}` |
-| `error_code`            | Categorizes an extraction error.                    | `SOURCE_TIMEOUT` or `NULL`           |
-| `error_message`         | Describes an error for operators.                   | Short diagnostic or `NULL`           |
-| `duration_ms`           | Records run duration.                               | Non-negative integer                 |
+| Field | Purpose | Example or format |
+| --- | --- | --- |
+| `pipeline_run_id` | Links all records for one run. | UUID |
+| `table_name` | Identifies the source table. | `public.orders` |
+| `extraction_started_at` | Records extraction start. | TIMESTAMPTZ |
+| `extraction_ended_at` | Records extraction completion or failure. | TIMESTAMPTZ |
+| `extraction_status` | Records the validation outcome. | `PASS`, `WARNING`, `FAIL` |
+| `records_read` | Counts source rows in the snapshot. | Non-negative integer; NULL if unavailable |
+| `records_extracted` | Counts rows copied into staging. | Non-negative integer; NULL if unavailable |
+| `records_rejected` | Counts individually excluded rows, if applicable. | `0`; records are not filtered during extraction |
+| `extraction_window` | Defines the source history read. | `All available history` |
+| `validation_results` | Stores check and table outcomes with affected counts. | JSONB |
+| `error_code` | Identifies the failure category. | `SOURCE_CONNECTION_FAILED`, `SCHEMA_MISMATCH`, or NULL |
+| `error_message` | Describes the failure without credentials. | TEXT or NULL |
+| `duration_ms` | Measures extraction runtime. | Non-negative integer |
+| `acceptance_status` | Records the handover decision separately from validation. | `APPROVED`, `MANUAL REVIEW`, `REJECTED` |
 
-Use the metadata to monitor runs, troubleshoot failures, audit extraction activity, and support recovery. A retry receives a new `pipeline_run_id`.
+Capture one run-start timestamp for the source snapshot and link table logs using the run ID. Retries receive new run IDs. Logs support monitoring, troubleshooting, auditing, and recovery; unavailable counts must not be reported as zero.
+
+Store logs in a restricted ETL operations table in the same PostgreSQL database, separate from `public` source records. During manual runs, Python must display staged counts and validation results. Failure logs must survive rollback of the extraction transaction. A separate logging transaction must store only run metadata, validation results, and error details; it must not extract or process source records. If the database is unavailable, record the failure once connectivity is restored, using the original run ID and timestamps.
 
 ## 5. Log Retention and Access
 
-- **Retention:** Keep operational extraction logs for at least one year to support monitoring and recovery.
-- **Storage:** Store logs in a restricted ETL operations log store, separate from source records.
-- **Access:** Limit log access to authorized ETL operators and system administrators. Restrict source credentials to the extraction runtime and authorized database administrators.
-- **Archiving:** Archive logs when needed for audit or recovery, preserving run IDs, timestamps, statuses, and validation results.
-- **Deletion:** Delete logs only after the retention period and only when they are no longer needed for troubleshooting, auditing, or recovery. An authorized ETL or database administrator performs and records deletion.
-- **Audit records:** Apply any longer organizational retention requirement to audit records separately from operational logs.
+- **Retention:** Keep extraction logs for at least one year to investigate failed runs, historical corrections, and reporting discrepancies.
+- **Storage:** Use the restricted ETL operations log table in the existing PostgreSQL database. Temporary staging is not a log store.
+- **Access:** Allow authorized ETL operators and database administrators to read logs. Restrict log writes and source credentials to authorized runtimes and administrators.
+- **Archiving:** Archive older logs within restricted PostgreSQL storage when needed, retaining run IDs, timestamps, results, and errors.
+- **Deletion:** An authorized database administrator checks retention and open investigations, then records any deletion. Never delete logs before one year or while needed for troubleshooting, auditing, or recovery.
+- **Audit records:** Follow any longer organizational retention requirement separately from operational extraction logs.
 
 ## 6. Extraction Data Contract and Naming Convention
 
-### Required schema
+### Required schema and naming
 
-The output contains the selected columns listed in Section 2. Preserve source identifiers, relationships, data types, values, and NULLs. Each table remains a separate dataset in its original row grain.
+| Source | Temporary output |
+| --- | --- |
+| `public.branches` | `pg_temp.stage_branches` |
+| `public.customers` | `pg_temp.stage_customers` |
+| `public.orders` | `pg_temp.stage_orders` |
+| `public.payments` | `pg_temp.stage_payments` |
+| `public.expenses` | `pg_temp.stage_expenses` |
 
-### Naming convention
+Each output contains exactly the selected columns in Section 2 with the same names, types, values, and NULLs. Preserve lowercase `snake_case`, `id` primary-key names, and foreign-key names such as `branch_id`, `customer_id`, and `order_id`. The `stage_` prefix identifies temporary extraction tables; no new column abbreviations are introduced.
 
-- Preserve lowercase `snake_case` source table and column names.
-- Keep primary keys named `id` and preserve foreign-key names such as `branch_id`, `customer_id`, and `order_id`.
-- Preserve UUID and exact `NUMERIC` values, dates, timestamps, text, and NULLs.
+UUIDs, exact NUMERIC values, text, dates, and timestamps remain in PostgreSQL. Staging tables do not enforce source key or NOT NULL constraints, so invalid values can be copied and reported without silent removal. The validation checks enforce the acceptance requirements.
 
-### Source-to-extract mapping
+### Source-to-output mapping
 
-Stage 1 does not standardize field names. Each selected column maps to an identically named output column with its source type and value.
+All selected columns map directly to identically named staging columns. No renaming or type conversion is performed.
 
-| Source column           | Output column  | Source type        | Target type        | Mapping type |
-| ----------------------- | -------------- | ------------------ | ------------------ | ------------ |
-| `orders.created_at`     | `created_at`   | `TIMESTAMPTZ NULL` | `TIMESTAMPTZ NULL` | Preserve     |
-| `payments.amount`       | `amount`       | `NUMERIC`          | `NUMERIC`          | Preserve     |
-| `expenses.expense_date` | `expense_date` | `DATE`             | `DATE`             | Preserve     |
+| Source column | Staged column | Source type | Output type | Mapping |
+| --- | --- | --- | --- | --- |
+| `orders.created_at` | `stage_orders.created_at` | TIMESTAMPTZ NULL | TIMESTAMPTZ NULL | Preserve |
+| `payments.amount` | `stage_payments.amount` | NUMERIC | NUMERIC | Preserve |
+| `expenses.expense_date` | `stage_expenses.expense_date` | DATE | DATE | Preserve |
 
 ### Schema consistency
 
-Check required tables, columns, data types, and identifiers before extraction. Stop the run if a required field is missing, renamed, or incompatible. Review schema changes before updating this contract.
+Check required columns and types before copying records. Stop if a required field is missing, renamed, or incompatible. Review the source change before updating queries and the contract. Added source columns outside the extraction scope do not change the output.
 
 ## 7. Extraction Acceptance and Handover Rules
 
-| Validation condition         | Acceptance criteria                                                                                         | Pipeline action                                                                                           | Decision / responsible role                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| All critical checks pass     | Required tables and columns exist; identifiers, uniqueness, row counts, snapshot, and output checks pass.   | Mark `APPROVED` and continue to Transformation.                                                           | Automatic.                                         |
-| Non-critical warnings remain | Nullable dates or references are reported, but extraction is complete.                                      | Hold for review; preserve the data unchanged.                                                             | `MANUAL REVIEW` by an ETL operator or data owner.  |
-| A critical check fails       | Required source data is unavailable, identifiers are invalid, counts mismatch, or extraction is incomplete. | Mark `REJECTED`; stop handover and quarantine partial output. Retry transient failures with a new run ID. | Automatic stop; ETL operator resolves the failure. |
+| Condition | Acceptance criteria | Pipeline action | Decision and responsible role |
+| --- | --- | --- | --- |
+| All checks pass | All five datasets are complete, with no failed checks or warnings. | Mark `APPROVED`; allow the next stage to use staging in the same transaction. | Automatic. |
+| Non-critical warnings | Extraction is complete, but nullable dates or references need review. | Mark `MANUAL REVIEW`; stop handover, retain diagnostic logs, and discard temporary staging when the run ends. Rerun after review. | ETL operator or data owner reviews the source issue. |
+| Critical failure | Required source access, schema, identifiers, references, dates, counts, or completion checks fail. | Mark `REJECTED`; stop handover and roll back staging. Retain failure logs. Retry temporary failures with a new run ID. | Automatic stop; ETL operator or database administrator resolves the failure. |
+
+Manual review must resolve the warning or record an approved explanation before a new extraction is assessed for handover. Critical failures must be resolved before approval.
 
 ### Handover
 
-Pass the five staged datasets, run metadata, validation results, errors, and acceptance status to Transformation. The next stage acknowledges the run ID and status. Cleaning, standardization, filtering, and business calculations are not part of this extraction stage.
+Handover must provide the five temporary stages, run ID, run timestamp, metadata, validation results, errors, and acceptance status. The next stage must acknowledge the run ID and decision within the same database transaction before consuming approved staged records. Held or rejected runs must retain diagnostic logs, discard staging, and require a new extraction after the issue is resolved. No file export or external staging store is used.
+
+A standalone extraction check through Python may display counts and validation results, then close the connection and remove temporary tables. This check is not a handover. Handover must occur while the temporary stages are still available. Cleaning, standardization, and business transformations are outside this stage.
 
 ## 8. Common Extraction Problems and Mitigation
 
-| Problem                               | Possible cause                                           | Impact                                                | Proposed mitigation                                                          |
-| ------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Database connection failure           | Network or database outage                               | Extraction cannot complete.                           | Retry transient failures; stop and report persistent failures.               |
-| Read permission failure               | Invalid credentials or changed grants                    | One or more tables cannot be extracted.               | Verify read access for each required table.                                  |
-| Schema change                         | Required table or column is renamed, removed, or changed | Query fails or output no longer matches the contract. | Stop extraction, review the change, and update the contract before retrying. |
-| Interrupted extraction                | Worker, connection, or output failure                    | Partial datasets may be handed over accidentally.     | Mark the run failed, quarantine partial output, and retry with a new run ID. |
-| Source/output count mismatch          | Truncated read or write                                  | Records may be missing or duplicated.                 | Compare counts per table; reject mismatched output.                          |
-| Missing or duplicate identifiers      | Source integrity or extraction error                     | Records cannot be reliably identified or related.     | Record the affected table and stop acceptance until resolved.                |
-| Late payment or historical correction | A source record changes after an earlier run             | Previous reporting periods may change.                | Re-extract full history on the next run.                                     |
-| Incorrect schedule timezone           | Scheduler is not set to Asia/Manila or UTC equivalent    | Extraction runs at the wrong time.                    | Verify the scheduler timezone and cron setting.                              |
+| Problem | Possible cause | Impact | Mitigation |
+| --- | --- | --- | --- |
+| Connection failure | Unreachable Supabase endpoint, invalid credentials, or database outage. | No complete snapshot can be extracted. | Check the connection configuration; use the session pooler where direct connectivity is unavailable. Retry temporary failures with a new run ID. |
+| Permission failure | Missing SELECT or temporary-table privileges. | Source checks or staging cannot finish. | Stop the run and have a database administrator restore the required access. |
+| Source schema change | Required fields are removed, renamed, or change type. | Queries or output no longer match the contract. | Reject the run; review and update the approved contract before retrying. |
+| Interrupted extraction | Connection loss or SQL execution failure. | Staging may be incomplete. | Roll back staging, block handover, retain failure logs, and retry temporary failures. |
+| Count mismatch | Incomplete or incorrect staging query. | Extracted rows are missing or duplicated. | Reject the run; compare source and staging counts in the same snapshot and fix the extraction query. |
+| Invalid identifiers, references, or dates | Missing source values or inconsistent records. | Extracted data does not meet acceptance criteria. | Record the failed or warning checks; hold or reject the run without editing source records. |
+| Late payments or historical corrections | Existing history changes after a successful run. | Earlier extracted history becomes outdated. | Extract full history again on the next run. |
+| Overlapping scheduled runs | A previous extraction has not finished. | Repeated full-history reads increase database load. | Prevent concurrent scheduled extractions with a transaction-scoped advisory lock. |
+| Incorrect schedule | Cron timezone or expression is wrong. | Extraction runs at the wrong business time. | Verify the UTC schedule corresponds to 01:00 Asia/Manila before enabling the job. |
 
 ## Expected Output
 
-Five extracted datasets in transaction-local staging, together with the run metadata, validation results, and acceptance status required for handover to Transformation.
+Five raw, validated datasets in PostgreSQL temporary staging at their original row grain, with run metadata, validation results, and an acceptance decision for handover within the same transaction. Source records must remain unchanged, and persistent logs must remain available after staging is removed. Python will wrap the extraction SQL without moving source records out of PostgreSQL.
