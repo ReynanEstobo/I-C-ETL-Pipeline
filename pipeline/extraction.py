@@ -39,6 +39,10 @@ class ExtractionError(RuntimeError):
     """Extraction could not produce all five datasets."""
 
 
+class AcceptanceBlocked(ExtractionError):
+    """Stop the staging transaction when extraction is not approved."""
+
+
 def check_source_schema(connection: psycopg.Connection) -> None:
     """Check required columns/types and SELECT access without reading rows."""
     with connection.cursor() as cursor:
@@ -286,6 +290,59 @@ def setup_extraction_logs():
             ''')
 
 
+def acceptance_decision(results, failed=False):
+    """Keep validation outcomes separate from acceptance decisions."""
+    if failed:
+        return 'REJECTED'
+    return {
+        'PASS': 'APPROVED', 'WARNING': 'MANUAL REVIEW', 'FAIL': 'REJECTED',
+    }.get(results.get('status'), 'REJECTED')
+
+
+def handover_extraction(connection, run_id, started, counts, results, consumer,
+                        *, source_counts, ended, duration):
+    """Offer approved SQL stages to a consumer before the transaction ends.
+
+    The consumer must use this connection without committing or closing it,
+    and return the same run ID and acceptance status as acknowledgment.
+    No consumer is invoked for held or rejected runs.
+    """
+    decision = acceptance_decision(results)
+    if decision != 'APPROVED':
+        raise AcceptanceBlocked(f'Handover blocked: {decision}.')
+    if connection.closed or connection.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+        raise ExtractionError('Handover requires the active extraction transaction.')
+    payload = {
+        'pipeline_run_id': run_id,
+        'extraction_started_at': started,
+        'extraction_ended_at': ended,
+        'duration_ms': duration,
+        'extraction_status': results['status'],
+        'extraction_window': 'All available history',
+        'acceptance_status': decision,
+        'validation_results': results,
+        'records_read': dict(source_counts),
+        'records_extracted': dict(counts),
+        'records_rejected': {table: 0 for table in SOURCE_COLUMNS},
+        'stages': {table: 'pg_temp.stage_' + table for table in SOURCE_COLUMNS},
+        'error_code': None,
+        'error_message': None,
+    }
+    try:
+        acknowledgment = consumer(connection, payload)
+    except Exception:
+        # Do not leak consumer errors that might contain connection secrets.
+        raise ExtractionError('The next stage could not acknowledge extraction.') from None
+    if connection.closed or connection.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+        raise ExtractionError('The handover consumer ended the extraction transaction.')
+    if not isinstance(acknowledgment, dict) or (
+        acknowledgment.get('pipeline_run_id') != run_id
+        or acknowledgment.get('acceptance_status') != decision
+    ):
+        raise ExtractionError('The next stage did not acknowledge the approved run.')
+    return acknowledgment
+
+
 def save_extraction_logs(run_id, started, ended, duration, source_counts,
                          staged_counts, results, error_code=None, error_message=None):
     """Commit only metadata on a separate connection after extraction ends."""
@@ -305,15 +362,17 @@ def save_extraction_logs(run_id, started, ended, duration, source_counts,
                         pipeline_run_id, table_name, extraction_started_at,
                         extraction_ended_at, extraction_status, records_read,
                         records_extracted, records_rejected, extraction_window,
-                        validation_results, error_code, error_message, duration_ms
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                        validation_results, error_code, error_message, duration_ms,
+                        acceptance_status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
                 ''', (run_id, 'public.' + table, started, ended, status,
                       source_counts.get(table), staged_counts.get(table),
                       'All available history', Jsonb(details), error_code,
-                      error_message, duration))
+                      error_message, duration,
+                      acceptance_decision(results, failed=bool(error_code))))
 
 
-def main() -> int:
+def main(consumer=None) -> int:
     if sys.argv[1:] == ['--setup-logs']:
         try:
             setup_extraction_logs()
@@ -345,8 +404,23 @@ def main() -> int:
             for table, status in results['tables'].items():
                 print(f"Table validation: {table}: {status}")
             print(f"Overall validation: {results['status']}")
+            decision = acceptance_decision(results)
+            print(f'Acceptance: {decision}')
+            if decision != 'APPROVED':
+                raise AcceptanceBlocked(f'Handover blocked: {decision}. Staging will be rolled back.')
+            if consumer is not None:
+                handover_extraction(
+                    connection, run_id, started, counts, results, consumer,
+                    source_counts=source_counts, ended=datetime.now(timezone.utc),
+                    duration=int((perf_counter() - timer) * 1000),
+                )
+                print('Approved extraction acknowledged by the next stage.')
+            else:
+                print('Standalone extraction check only; no next stage was invoked.')
             print('Records stayed in PostgreSQL; Python read only counts and check results.')
         print('Connection closed. Temporary staging tables were removed.')
+    except AcceptanceBlocked as error:
+        print(error)
     except (ExtractionError, SourceConnectionError) as error:
         print(error)
         error_code = ('SOURCE_CONNECTION_FAILED' if isinstance(error, SourceConnectionError)
@@ -368,7 +442,7 @@ def main() -> int:
         print(f'Run ID: {run_id}; start: {started.isoformat()}; end: {ended.isoformat()}')
         return 1
     print(f'Run details saved in etl_ops.extraction_logs ({duration} ms).')
-    return 1 if error_code else 0
+    return 1 if error_code else 2 if results.get('status') == 'WARNING' else 0
 
 
 if __name__ == '__main__':
