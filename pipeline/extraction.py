@@ -43,6 +43,13 @@ class AcceptanceBlocked(ExtractionError):
     """Stop the staging transaction when extraction is not approved."""
 
 
+def record_run_check(checks, name, status):
+    """Store one outcome per run-level check without recording credentials."""
+    checks[:] = [check for check in checks if check['check'] != name]
+    checks.append({'table': '*', 'check': name, 'status': status,
+                   'affected_rows': 1 if status == 'FAIL' else 0})
+
+
 def check_source_schema(connection: psycopg.Connection) -> None:
     """Check required columns/types and SELECT access without reading rows."""
     with connection.cursor() as cursor:
@@ -84,14 +91,18 @@ def check_source_schema(connection: psycopg.Connection) -> None:
 
 
 @contextmanager
-def extract_source(source_counts=None, staged_counts=None):
+def extract_source(source_counts=None, staged_counts=None, run_checks=None):
     """Stage source rows in SQL and yield the connection and row counts.
 
     Stages remain available inside this context only. Future SQL validation
     must use the yielded connection before leaving this transaction.
     """
+    run_checks = run_checks if run_checks is not None else []
+    phase = 'source_accessibility'
     try:
         with connect_source() as connection:
+            record_run_check(run_checks, phase, 'PASS')
+            phase = 'completion'
             # PostgreSQL forbids CREATE TABLE in read-only transactions.
             # Create empty temporary structures before taking the source snapshot.
             connection.read_only = False
@@ -111,6 +122,7 @@ def extract_source(source_counts=None, staged_counts=None):
             connection.read_only = True
             connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             with connection.transaction():
+                phase = 'snapshot_consistency'
                 with connection.cursor() as cursor:
                     cursor.execute('SHOW transaction_read_only')
                     if cursor.fetchone() != ('on',):
@@ -119,7 +131,11 @@ def extract_source(source_counts=None, staged_counts=None):
                     if cursor.fetchone() != ('repeatable read',):
                         raise ExtractionError('Extraction requires a consistent snapshot.')
 
+                record_run_check(run_checks, phase, 'PASS')
+                phase = 'schema_compatibility'
                 check_source_schema(connection)
+                record_run_check(run_checks, phase, 'PASS')
+                phase = 'completion'
                 counts = {}
                 for table, columns in SOURCE_COLUMNS.items():
                     try:
@@ -150,7 +166,13 @@ def extract_source(source_counts=None, staged_counts=None):
                             'Extraction was rolled back; source records were unchanged.'
                         ) from None
                 yield connection, counts
+    except AcceptanceBlocked:
+        raise
+    except (SourceConnectionError, ExtractionError):
+        record_run_check(run_checks, phase, 'FAIL')
+        raise
     except psycopg.Error:
+        record_run_check(run_checks, phase, 'FAIL')
         raise ExtractionError(
             'Extraction failed. Check database access, temporary-table permissions, '
             'and network connectivity. Source records were unchanged.'
@@ -303,8 +325,9 @@ def handover_extraction(connection, run_id, started, counts, results, consumer,
                         *, source_counts, ended, duration):
     """Offer approved SQL stages to a consumer before the transaction ends.
 
-    The consumer must use this connection without committing or closing it,
-    and return the same run ID and acceptance status as acknowledgment.
+    consumer.acknowledge(metadata) must confirm the run before
+    consumer.consume(connection, payload) receives the staging connection.
+    The consumer must not commit or close the connection.
     No consumer is invoked for held or rejected runs.
     """
     decision = acceptance_decision(results)
@@ -329,7 +352,9 @@ def handover_extraction(connection, run_id, started, counts, results, consumer,
         'error_message': None,
     }
     try:
-        acknowledgment = consumer(connection, payload)
+        acknowledgment = consumer.acknowledge({
+            'pipeline_run_id': run_id, 'acceptance_status': decision,
+        })
     except Exception:
         # Do not leak consumer errors that might contain connection secrets.
         raise ExtractionError('The next stage could not acknowledge extraction.') from None
@@ -340,6 +365,12 @@ def handover_extraction(connection, run_id, started, counts, results, consumer,
         or acknowledgment.get('acceptance_status') != decision
     ):
         raise ExtractionError('The next stage did not acknowledge the approved run.')
+    try:
+        consumer.consume(connection, payload)
+    except Exception:
+        raise ExtractionError('The next stage could not consume approved staging.') from None
+    if connection.closed or connection.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+        raise ExtractionError('The handover consumer ended the extraction transaction.')
     return acknowledgment
 
 
@@ -355,7 +386,7 @@ def save_extraction_logs(run_id, started, ended, duration, source_counts,
                 details = {
                     'overall_status': 'FAIL' if error_code else results['status'],
                     'checks': [check for check in results.get('checks', [])
-                               if check['table'] == table],
+                               if check['table'] in (table, '*')],
                 }
                 cursor.execute('''
                     INSERT INTO etl_ops.extraction_logs (
@@ -390,14 +421,16 @@ def main(consumer=None) -> int:
     timer = perf_counter()
     source_counts, staged_counts = {}, {}
     results = {}
+    run_checks = []
     error_code = error_message = None
     print(f'Run ID: {run_id}')
     try:
-        with extract_source(source_counts, staged_counts) as (connection, counts):
+        with extract_source(source_counts, staged_counts, run_checks) as (connection, counts):
             print('Extraction completed from one read-only snapshot.')
             for table, count in counts.items():
                 print(f'stage_{table}: {count} rows')
             results = validate_staged_data(connection)
+            record_run_check(run_checks, 'completion', 'PASS')
             for check in results['checks']:
                 print(f"{check['status']}: {check['table']}.{check['check']} "
                       f"(affected rows: {check['affected_rows']})")
@@ -428,6 +461,20 @@ def main(consumer=None) -> int:
         # Store fixed messages rather than raw database errors or credentials.
         error_message = ('Source connection failed.' if isinstance(error, SourceConnectionError)
                          else 'Extraction or SQL validation could not complete.')
+        record_run_check(run_checks, 'completion', 'FAIL')
+    # Early failures retain the checks completed before the failing operation.
+    results.setdefault('checks', []).extend(run_checks)
+    tables = {}
+    for table in SOURCE_COLUMNS:
+        statuses = {check['status'] for check in results['checks']
+                    if check['table'] in (table, '*')}
+        tables[table] = ('FAIL' if 'FAIL' in statuses else
+                         'WARNING' if 'WARNING' in statuses else 'PASS')
+    results['tables'] = tables
+    results['status'] = ('FAIL' if 'FAIL' in tables.values() else
+                         'WARNING' if 'WARNING' in tables.values() else 'PASS')
+    for check in run_checks:
+        print(f"{check['status']}: run.{check['check']}")
     ended = datetime.now(timezone.utc)
     duration = int((perf_counter() - timer) * 1000)
     if not error_code and results.get('status') == 'FAIL':
