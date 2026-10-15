@@ -139,7 +139,11 @@ def extract_source():
         ) from None
 
 
-def validate_staged_data(connection: psycopg.Connection) -> dict:
+def validate_staged_data(
+    connection: psycopg.Connection,
+    source_schema: str = 'public',
+    source_prefix: str = '',
+) -> dict:
     """Run issue #3 checks in SQL; return counts and statuses, never records.
 
     Call inside extract_source() so source counts and stages share a snapshot.
@@ -160,7 +164,7 @@ def validate_staged_data(connection: psycopg.Connection) -> dict:
             stage = sql.Identifier('pg_temp', 'stage_' + table)
             record(table, 'row_count', sql.SQL(
                 'SELECT abs((SELECT count(*) FROM {}) - (SELECT count(*) FROM {}))'
-            ).format(sql.Identifier('public', table), stage))
+            ).format(sql.Identifier(source_schema, source_prefix + table), stage))
             columns = ['id', 'order_number'] if table == 'orders' else ['id']
             for column in columns:
                 field = sql.Identifier(column)
