@@ -97,12 +97,15 @@ Store logs in a restricted ETL operations table in the same PostgreSQL database,
 
 The Python wrapper must keep undelivered log metadata in a private local `.pending-extraction-logs` directory so it survives restarts. This queue must contain no credentials or extracted source records and must be excluded from Git. Replay pending entries before the next extraction, or with `python -m pipeline.extraction --flush-logs`. Keep original run IDs and timestamps, prevent duplicate database entries, and remove a queued entry only after its database transaction commits. The queue is temporary metadata storage, not an extraction staging store.
 
+Scheduled runs must commit metadata to the restricted `etl_ops.pending_extraction_logs` table before delivering it to the final log table. Replay must preserve run IDs and timestamps, avoid duplicate entries, and remove pending rows only in the transaction that confirms final storage. Replay occurs before the next scheduled extraction or through `python -m pipeline.scheduling recover`. This queue contains metadata only. If PostgreSQL is entirely unavailable or the connection ends before pending metadata commits, in-database recovery cannot guarantee a complete extraction log; the operator must inspect Cron history and database service logs, record the available failure evidence after recovery, and rerun extraction with a new run ID.
+
 ## 5. Log Retention and Access
 
 - **Retention:** Keep extraction logs for at least one year to investigate failed runs, historical corrections, and reporting discrepancies.
 - **Storage:** Use the restricted ETL operations log table in the existing PostgreSQL database. Temporary staging is not a log store.
 - **Access:** Allow authorized ETL operators and database administrators to read logs. Restrict log writes and source credentials to authorized runtimes and administrators.
 - **Pending logs:** Restrict the local queue to the operating-system account running the wrapper. Retain undelivered entries until database storage is confirmed; the one-year retention period applies to the saved database logs.
+- **Scheduled pending logs:** Restrict the database metadata queue to approved logging roles. Retain pending rows until final-log delivery is confirmed; source records must never be stored there.
 - **Archiving:** Archive older logs within restricted PostgreSQL storage when needed, retaining run IDs, timestamps, results, and errors.
 - **Deletion:** An authorized database administrator checks retention and open investigations, then records any deletion. Never delete logs before one year or while needed for troubleshooting, auditing, or recovery.
 - **Audit records:** Follow any longer organizational retention requirement separately from operational extraction logs.

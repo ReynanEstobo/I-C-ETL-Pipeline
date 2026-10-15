@@ -18,6 +18,47 @@ JOB_NAME = 'ic_laundry_daily_extraction'
 JOB_COMMAND = 'CALL etl_ops.run_scheduled_extraction();'
 
 
+def log_recovery_sql(schema='etl_ops'):
+    """Durable database metadata queue and atomic, duplicate-safe delivery."""
+    columns = sql.SQL(', ').join(map(sql.Identifier, (
+        'pipeline_run_id', 'table_name', 'extraction_started_at', 'extraction_ended_at',
+        'extraction_status', 'records_read', 'records_extracted', 'records_rejected',
+        'extraction_window', 'validation_results', 'error_code', 'error_message',
+        'duration_ms', 'acceptance_status',
+    )))
+    pending = sql.Identifier(schema, 'pending_extraction_logs')
+    logs = sql.Identifier(schema, 'extraction_logs')
+    function = sql.Identifier(schema, 'recover_extraction_logs')
+    return sql.SQL('''
+        CREATE TABLE IF NOT EXISTS {} (
+            LIKE {} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
+        );
+        REVOKE ALL ON {} FROM PUBLIC;
+        ALTER TABLE {} ENABLE ROW LEVEL SECURITY;
+        CREATE OR REPLACE FUNCTION {}(requested_run uuid DEFAULT NULL)
+        RETURNS bigint LANGUAGE plpgsql SECURITY INVOKER AS $recover$
+        DECLARE delivered bigint;
+        BEGIN
+            -- Serialize metadata replay independently from extraction's lock.
+            PERFORM pg_advisory_xact_lock(18755, 1163152461);
+            INSERT INTO {} ({})
+                SELECT {} FROM {}
+                WHERE requested_run IS NULL OR pipeline_run_id = requested_run
+                ON CONFLICT (pipeline_run_id, table_name) DO NOTHING;
+            DELETE FROM {} pending
+                WHERE (requested_run IS NULL OR pending.pipeline_run_id = requested_run)
+                  AND EXISTS (SELECT 1 FROM {} saved
+                    WHERE saved.pipeline_run_id = pending.pipeline_run_id
+                      AND saved.table_name = pending.table_name);
+            GET DIAGNOSTICS delivered = ROW_COUNT;
+            RETURN delivered;
+        END;
+        $recover$;
+        REVOKE ALL ON FUNCTION {}(uuid) FROM PUBLIC;
+    ''').format(pending, logs, pending, pending, function,
+                logs, columns, columns, pending, pending, logs, function)
+
+
 def check_statement(table, name, status, affected='0'):
     return sql.SQL('''
         checks := checks || jsonb_build_array(jsonb_build_object(
@@ -90,6 +131,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
         BEGIN
             -- Empty temporary structures only; source reads start after COMMIT.
             SET TRANSACTION READ WRITE;
+            PERFORM etl_ops.recover_extraction_logs();
             {}
             SET SESSION CHARACTERISTICS AS TRANSACTION
                 ISOLATION LEVEL REPEATABLE READ, READ ONLY;
@@ -207,7 +249,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                                 ELSE 'PASS' END INTO table_status
                     FROM jsonb_array_elements(checks) c
                     WHERE c->>'table' IN (table_entry.key, '*');
-                    INSERT INTO etl_ops.extraction_logs (
+                    INSERT INTO etl_ops.pending_extraction_logs (
                         pipeline_run_id, table_name, extraction_started_at, extraction_ended_at,
                         extraction_status, records_read, records_extracted, records_rejected,
                         extraction_window, validation_results, error_code, error_message,
@@ -224,6 +266,9 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                         floor(extract(epoch FROM ended - started) * 1000)::bigint, acceptance
                     ) ON CONFLICT (pipeline_run_id, table_name) DO NOTHING;
                 END LOOP;
+                -- Queue metadata durably before attempting final-log delivery.
+                COMMIT;
+                PERFORM etl_ops.recover_extraction_logs(run_id);
                 SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
                 COMMIT;
                 RAISE NOTICE 'Extraction run %: %', run_id, acceptance;
@@ -384,7 +429,77 @@ def test_scheduled_extraction():
                 print('Isolated test schema removed. Operational tables and Cron jobs were unchanged.')
 
 
+def test_scheduled_log_recovery():
+    """Test the real delivery function against private synthetic log tables."""
+    schema = 'etl_test_' + uuid4().hex
+    with connect_source() as connection:
+        connection.read_only = False
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
+                cursor.execute(sql.SQL('REVOKE ALL ON SCHEMA {} FROM PUBLIC').format(sql.Identifier(schema)))
+                cursor.execute(sql.SQL('CREATE TABLE {} (LIKE etl_ops.extraction_logs INCLUDING ALL)').format(
+                    sql.Identifier(schema, 'extraction_logs')))
+                cursor.execute(log_recovery_sql(schema))
+                cursor.execute(sql.SQL('''
+                    CREATE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS $test$
+                    BEGIN RAISE EXCEPTION 'Simulated final-log write failure'; END;
+                    $test$;
+                    CREATE TRIGGER fail_delivery BEFORE INSERT ON {}
+                        FOR EACH ROW EXECUTE FUNCTION {}();
+                ''').format(sql.Identifier(schema, 'fail_delivery'),
+                            sql.Identifier(schema, 'extraction_logs'),
+                            sql.Identifier(schema, 'fail_delivery')))
+                run_id = uuid4()
+                timestamp = datetime.now(timezone.utc)
+                cursor.execute(sql.SQL('''INSERT INTO {} (
+                    pipeline_run_id, table_name, extraction_started_at, extraction_ended_at,
+                    extraction_status, records_read, records_extracted, extraction_window,
+                    validation_results, duration_ms, acceptance_status
+                ) VALUES (%s, 'test.orders', %s, %s, 'FAIL', NULL, NULL,
+                          'All available history', '{{}}'::jsonb, 0, 'REJECTED')''').format(
+                    sql.Identifier(schema, 'pending_extraction_logs')),
+                    (run_id, timestamp, timestamp))
+            connection.commit()
+            recover = sql.SQL('SELECT {}()').format(sql.Identifier(schema, 'recover_extraction_logs'))
+            try:
+                connection.execute(recover)
+                raise AssertionError('Simulated log-write failure was not raised')
+            except psycopg.Error as error:
+                assert error.sqlstate == 'P0001'
+                connection.rollback()
+            pending = sql.Identifier(schema, 'pending_extraction_logs')
+            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(pending)).fetchone()[0] == 1
+            print('PASS: committed pending metadata survived final-log rollback')
+            connection.execute(sql.SQL('DROP TRIGGER fail_delivery ON {}').format(
+                sql.Identifier(schema, 'extraction_logs')))
+            connection.commit()
+            assert connection.execute(recover).fetchone()[0] == 1
+            connection.commit()
+            logs = sql.Identifier(schema, 'extraction_logs')
+            saved = connection.execute(sql.SQL('SELECT pipeline_run_id, extraction_started_at FROM {}').format(logs)).fetchone()
+            assert saved == (run_id, timestamp)
+            print('PASS: original run ID and timestamp preserved after recovery')
+            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(pending)).fetchone()[0] == 0
+            # Simulate uncertain delivery by replaying an already committed row.
+            connection.execute(sql.SQL('INSERT INTO {} SELECT * FROM {}').format(pending, logs))
+            connection.commit()
+            assert connection.execute(recover).fetchone()[0] == 1
+            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(logs)).fetchone()[0] == 1
+            connection.commit()
+            print('PASS: replay removed confirmed metadata without duplicate logs')
+        finally:
+            connection.rollback()
+            connection.read_only = False
+            connection.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(schema)))
+            connection.commit()
+            print('Recovery test schema removed; operational tables and logs were unchanged.')
+
+
 def manage_schedule(action):
+    if action == 'test-recovery':
+        test_scheduled_log_recovery()
+        return
     if action == 'test':
         test_scheduled_extraction()
         return
@@ -401,8 +516,14 @@ def manage_schedule(action):
             return
         if action == 'update':
             with connection.cursor() as cursor:
+                cursor.execute(log_recovery_sql())
                 cursor.execute(procedure_sql())
             print('Database procedure updated. Cron schedule and active status were unchanged.')
+            return
+        if action == 'recover':
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT etl_ops.recover_extraction_logs()')
+                print(f'Recovered {cursor.fetchone()[0]} pending table-log rows.')
             return
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
@@ -410,6 +531,7 @@ def manage_schedule(action):
                 raise ValueError('Enable pg_cron in Supabase before schedule setup.')
             expression = cron_expression(connection)
             if action == 'setup':
+                cursor.execute(log_recovery_sql())
                 cursor.execute(procedure_sql())
                 cursor.execute('SELECT cron.schedule(%s, %s, %s)',
                                (JOB_NAME, expression, JOB_COMMAND))
@@ -439,8 +561,8 @@ def manage_schedule(action):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update'):
-        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update')
+    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update','recover','test-recovery'):
+        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update|recover|test-recovery')
         return 1
     try:
         manage_schedule(sys.argv[1])
