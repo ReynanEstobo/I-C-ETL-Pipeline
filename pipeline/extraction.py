@@ -13,6 +13,11 @@ from psycopg.types.json import Jsonb
 from pipeline.connection import SourceConnectionError, connect_source
 
 
+# Shared lock identity for every manual and future scheduled extraction.
+# Both values fit PostgreSQL's two-integer advisory-lock signature.
+EXTRACTION_LOCK_KEY = (18755, 1163152460)
+
+
 # PostgreSQL's internal type names, in the output column order.
 SOURCE_COLUMNS = {
     "branches": {
@@ -41,6 +46,10 @@ class ExtractionError(RuntimeError):
 
 class AcceptanceBlocked(ExtractionError):
     """Stop the staging transaction when extraction is not approved."""
+
+
+class ExtractionAlreadyRunning(ExtractionError):
+    """Another extraction owns the transaction-scoped advisory lock."""
 
 
 def record_run_check(checks, name, status):
@@ -122,6 +131,17 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
             connection.read_only = True
             connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             with connection.transaction():
+                phase = 'overlap_lock'
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT pg_try_advisory_xact_lock(%s, %s)',
+                        EXTRACTION_LOCK_KEY,
+                    )
+                    if cursor.fetchone() != (True,):
+                        raise ExtractionAlreadyRunning(
+                            'Another extraction is running. This run stopped before reading source records.'
+                        )
+                record_run_check(run_checks, phase, 'PASS')
                 phase = 'snapshot_consistency'
                 with connection.cursor() as cursor:
                     cursor.execute('SHOW transaction_read_only')
@@ -456,10 +476,13 @@ def main(consumer=None) -> int:
         print(error)
     except (ExtractionError, SourceConnectionError) as error:
         print(error)
-        error_code = ('SOURCE_CONNECTION_FAILED' if isinstance(error, SourceConnectionError)
+        error_code = ('EXTRACTION_ALREADY_RUNNING' if isinstance(error, ExtractionAlreadyRunning)
+                      else 'SOURCE_CONNECTION_FAILED' if isinstance(error, SourceConnectionError)
                       else 'EXTRACTION_FAILED')
         # Store fixed messages rather than raw database errors or credentials.
-        error_message = ('Source connection failed.' if isinstance(error, SourceConnectionError)
+        error_message = ('Another extraction holds the advisory lock. No source records were read.'
+                         if isinstance(error, ExtractionAlreadyRunning)
+                         else 'Source connection failed.' if isinstance(error, SourceConnectionError)
                          else 'Extraction or SQL validation could not complete.')
         record_run_check(run_checks, 'completion', 'FAIL')
     # Early failures retain the checks completed before the failing operation.
