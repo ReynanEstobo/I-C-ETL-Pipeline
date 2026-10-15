@@ -73,13 +73,18 @@ def record_run_check(checks, name, status):
 
 
 def check_source_schema(connection: psycopg.Connection) -> None:
-    """Check required columns/types and SELECT access without reading rows."""
+    """Check structure using catalogs, independently of SELECT privileges."""
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT table_name, column_name, udt_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ANY(%s)
+            SELECT c.relname, a.attname, t.typname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+            JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+            WHERE n.nspname = 'public' AND c.relname = ANY(%s)
+              AND a.attnum > 0 AND NOT a.attisdropped
+              AND c.relkind IN ('r', 'p')
             """,
             (list(SOURCE_COLUMNS),),
         )
@@ -89,7 +94,7 @@ def check_source_schema(connection: psycopg.Connection) -> None:
             for column, expected in columns.items():
                 found = actual.get((table, column))
                 if found is None:
-                    problems.append(f"public.{table}.{column} is missing or inaccessible")
+                    problems.append(f"public.{table}.{column} is missing")
                 elif found != expected:
                     problems.append(
                         f"public.{table}.{column} requires {expected}, found {found}"
@@ -97,6 +102,11 @@ def check_source_schema(connection: psycopg.Connection) -> None:
         if problems:
             raise ExtractionError("Source schema check failed: " + "; ".join(problems))
 
+
+
+def check_source_access(connection: psycopg.Connection) -> None:
+    """Require SELECT access on every selected source column, without rows."""
+    with connection.cursor() as cursor:
         for table, columns in SOURCE_COLUMNS.items():
             try:
                 cursor.execute(
@@ -124,7 +134,7 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
     phase = 'source_accessibility'
     try:
         with connect_source() as connection:
-            record_run_check(run_checks, phase, 'PASS')
+            record_run_check(run_checks, 'source_connection', 'PASS')
             phase = 'completion'
             # PostgreSQL forbids CREATE TABLE in read-only transactions.
             # Create empty temporary structures before taking the source snapshot.
@@ -168,6 +178,9 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
                 record_run_check(run_checks, phase, 'PASS')
                 phase = 'schema_compatibility'
                 check_source_schema(connection)
+                record_run_check(run_checks, phase, 'PASS')
+                phase = 'source_accessibility'
+                check_source_access(connection)
                 record_run_check(run_checks, phase, 'PASS')
                 phase = 'completion'
                 counts = {}

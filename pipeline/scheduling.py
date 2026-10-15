@@ -127,15 +127,25 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                     phase := 'schema_compatibility';
                     FOR table_entry IN SELECT * FROM jsonb_each(expected) LOOP
                         FOR column_entry IN SELECT * FROM jsonb_each_text(table_entry.value) LOOP
-                            SELECT udt_name INTO actual_type
-                            FROM information_schema.columns
-                            WHERE table_schema = {}
-                              AND table_name = table_entry.key
-                              AND column_name = column_entry.key;
+                            SELECT t.typname INTO actual_type
+                            FROM pg_catalog.pg_class c
+                            JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+                            JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                            JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                            WHERE ns.nspname = {} AND c.relname = table_entry.key
+                              AND a.attname = column_entry.key
+                              AND a.attnum > 0 AND NOT a.attisdropped
+                              AND c.relkind IN ('r', 'p');
                             IF actual_type IS DISTINCT FROM column_entry.value THEN
                                 failure_code := 'SCHEMA_MISMATCH';
                                 RAISE EXCEPTION 'Source schema does not match extraction contract';
                             END IF;
+                        END LOOP;
+                    END LOOP;
+                    {}
+                    phase := 'source_accessibility';
+                    FOR table_entry IN SELECT * FROM jsonb_each(expected) LOOP
+                        FOR column_entry IN SELECT * FROM jsonb_each_text(table_entry.value) LOOP
                             EXECUTE format('SELECT %I FROM %I.%I LIMIT 0',
                                            column_entry.key, {}, table_entry.key);
                         END LOOP;
@@ -236,12 +246,14 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
         sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
         sql.Literal(json.dumps(SOURCE_COLUMNS)),
         sql.SQL('\n').join(stages),
-        check_statement('*', 'source_accessibility', "'PASS'"),
+        check_statement('*', 'source_connection', "'PASS'"),
         sql.Literal(EXTRACTION_LOCK_KEY[0]), sql.Literal(EXTRACTION_LOCK_KEY[1]),
         check_statement('*', 'overlap_lock', "'PASS'"),
         check_statement('*', 'snapshot_consistency', "'PASS'"),
-        sql.Literal(source_schema), sql.Literal(source_schema),
+        sql.Literal(source_schema),
         check_statement('*', 'schema_compatibility', "'PASS'"),
+        sql.Literal(source_schema),
+        check_statement('*', 'source_accessibility', "'PASS'"),
         sql.SQL('\n').join(reads), sql.SQL('\n').join(validations),
         check_statement('*', 'completion', "'PASS'"),
         sql.Literal(source_schema),
@@ -387,6 +399,11 @@ def manage_schedule(action):
                 cursor.execute(JOB_COMMAND)
             print('Database extraction check completed. Inspect extraction logs.')
             return
+        if action == 'update':
+            with connection.cursor() as cursor:
+                cursor.execute(procedure_sql())
+            print('Database procedure updated. Cron schedule and active status were unchanged.')
+            return
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'")
             if not cursor.fetchone():
@@ -422,8 +439,8 @@ def manage_schedule(action):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test'):
-        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test')
+    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update'):
+        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update')
         return 1
     try:
         manage_schedule(sys.argv[1])
