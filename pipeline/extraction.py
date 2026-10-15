@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from time import perf_counter
+from time import perf_counter, sleep
 from uuid import uuid4
 import sys
 
@@ -10,7 +10,9 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from pipeline.connection import SourceConnectionError, connect_source
+from pipeline.connection import (
+    SourceConnectionError, connect_source, is_temporary_database_error,
+)
 
 
 # Shared lock identity for every manual and future scheduled extraction.
@@ -42,6 +44,10 @@ SOURCE_COLUMNS = {
 
 class ExtractionError(RuntimeError):
     """Extraction could not produce all five datasets."""
+
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class AcceptanceBlocked(ExtractionError):
@@ -92,10 +98,11 @@ def check_source_schema(connection: psycopg.Connection) -> None:
                         sql.Identifier("public", table),
                     )
                 )
-            except psycopg.Error:
+            except psycopg.Error as error:
                 raise ExtractionError(
                     f"Cannot read the required columns from public.{table}. "
-                    "Check source permissions and schema."
+                    "Check source permissions and schema.",
+                    retryable=is_temporary_database_error(error),
                 ) from None
 
 
@@ -180,10 +187,11 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
                             counts[table] = cursor.fetchone()[0]
                             if staged_counts is not None:
                                 staged_counts[table] = counts[table]
-                    except psycopg.Error:
+                    except psycopg.Error as error:
                         raise ExtractionError(
                             f'Could not stage public.{table}. '
-                            'Extraction was rolled back; source records were unchanged.'
+                            'Extraction was rolled back; source records were unchanged.',
+                            retryable=is_temporary_database_error(error),
                         ) from None
                 yield connection, counts
     except AcceptanceBlocked:
@@ -191,11 +199,12 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
     except (SourceConnectionError, ExtractionError):
         record_run_check(run_checks, phase, 'FAIL')
         raise
-    except psycopg.Error:
+    except psycopg.Error as error:
         record_run_check(run_checks, phase, 'FAIL')
         raise ExtractionError(
             'Extraction failed. Check database access, temporary-table permissions, '
-            'and network connectivity. Source records were unchanged.'
+            'and network connectivity. Source records were unchanged.',
+            retryable=is_temporary_database_error(error),
         ) from None
 
 
@@ -423,7 +432,9 @@ def save_extraction_logs(run_id, started, ended, duration, source_counts,
                       acceptance_decision(results, failed=bool(error_code))))
 
 
-def main(consumer=None) -> int:
+def run_extraction_attempt(consumer=None, retry_state=None) -> int:
+    retry_state = retry_state if retry_state is not None else {}
+    retry_state['retryable'] = False
     if sys.argv[1:] == ['--setup-logs']:
         try:
             setup_extraction_logs()
@@ -475,6 +486,8 @@ def main(consumer=None) -> int:
     except AcceptanceBlocked as error:
         print(error)
     except (ExtractionError, SourceConnectionError) as error:
+        # A consumer may have performed work; do not replay handover implicitly.
+        retry_state['retryable'] = error.retryable and consumer is None
         print(error)
         error_code = ('EXTRACTION_ALREADY_RUNNING' if isinstance(error, ExtractionAlreadyRunning)
                       else 'SOURCE_CONNECTION_FAILED' if isinstance(error, SourceConnectionError)
@@ -507,12 +520,31 @@ def main(consumer=None) -> int:
         save_extraction_logs(run_id, started, ended, duration, source_counts,
                              staged_counts, results, error_code, error_message)
     except (psycopg.Error, SourceConnectionError):
+        # Never start another extraction while this attempt's log is unsaved.
+        retry_state['retryable'] = False
         print('Could not save extraction logs. The run is not fully logged.')
         print('Check log setup, permissions, and database connectivity before retrying.')
         print(f'Run ID: {run_id}; start: {started.isoformat()}; end: {ended.isoformat()}')
         return 1
     print(f'Run details saved in etl_ops.extraction_logs ({duration} ms).')
     return 1 if error_code else 2 if results.get('status') == 'WARNING' else 0
+
+
+def main(consumer=None) -> int:
+    """Try at most three times, with a fresh UUID and snapshot per attempt."""
+    for attempt in range(1, 4):
+        retry_state = {}
+        code = run_extraction_attempt(consumer, retry_state)
+        if code != 1 or not retry_state['retryable']:
+            return code
+        if attempt == 3:
+            print('Temporary failure persisted. Stopped after 3 extraction attempts.')
+            return 1
+        delay = 2 * attempt
+        print(f'Temporary failure. Retrying in {delay} seconds '
+              f'(attempt {attempt + 1}/3, with a new run ID).')
+        sleep(delay)
+    return 1
 
 
 if __name__ == '__main__':

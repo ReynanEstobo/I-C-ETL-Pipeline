@@ -10,6 +10,29 @@ from dotenv import load_dotenv
 class SourceConnectionError(RuntimeError):
     """A safe connection error that does not disclose credentials."""
 
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def is_temporary_database_error(error):
+    """Classify failures without exposing the original database message."""
+    state = getattr(error, 'sqlstate', None)
+    if state:
+        return state.startswith('08') or state in {
+            '40001', '40P01', '53300', '57P01', '57P02', '57P03',
+        }
+    # libpq may omit SQLSTATE for authentication and network failures.
+    message = str(error).lower()
+    if any(text in message for text in (
+        'password authentication failed', 'no password supplied',
+        'invalid connection option', 'invalid integer value',
+        'certificate verify failed', 'role does not exist',
+        'database does not exist', 'no pg_hba.conf entry',
+    )):
+        return False
+    return isinstance(error, psycopg.OperationalError)
+
 
 def connect_source() -> psycopg.Connection:
     """Open an encrypted connection whose transactions default to read-only.
@@ -34,12 +57,13 @@ def connect_source() -> psycopg.Connection:
         )
         connection.read_only = True
         return connection
-    except (psycopg.Error, ValueError):
+    except (psycopg.Error, ValueError) as error:
         if connection is not None:
             connection.close()
         raise SourceConnectionError(
             "Could not connect to the source database. Check your connection "
-            "details, password, and network access."
+            "details, password, and network access.",
+            retryable=is_temporary_database_error(error),
         ) from None
 
 
