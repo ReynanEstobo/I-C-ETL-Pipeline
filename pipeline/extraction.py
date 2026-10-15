@@ -209,9 +209,15 @@ def validate_staged_data(
                 'SELECT count(*) FROM {} WHERE {} IS NOT NULL AND NOT isfinite({})'
             ).format(stage, field, field))
 
-    statuses = {check['status'] for check in checks}
-    overall = 'FAIL' if 'FAIL' in statuses else 'WARNING' if 'WARNING' in statuses else 'PASS'
-    return {'status': overall, 'checks': checks}
+    def summarize(statuses):
+        return 'FAIL' if 'FAIL' in statuses else 'WARNING' if 'WARNING' in statuses else 'PASS'
+
+    tables = {
+        table: summarize({check['status'] for check in checks if check['table'] == table})
+        for table in SOURCE_COLUMNS
+    }
+    overall = summarize(set(tables.values()))
+    return {'status': overall, 'tables': tables, 'checks': checks}
 
 
 def main() -> int:
@@ -224,6 +230,8 @@ def main() -> int:
             for check in results['checks']:
                 print(f"{check['status']}: {check['table']}.{check['check']} "
                       f"(affected rows: {check['affected_rows']})")
+            for table, status in results['tables'].items():
+                print(f"Table validation: {table}: {status}")
             print(f"Overall validation: {results['status']}")
             print('Records stayed in PostgreSQL; Python read only counts and check results.')
         print('Connection closed. Temporary staging tables were removed.')
