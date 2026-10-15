@@ -107,6 +107,24 @@ The Python wrapper must keep undelivered log metadata in a private local `.pendi
 - **Deletion:** An authorized database administrator checks retention and open investigations, then records any deletion. Never delete logs before one year or while needed for troubleshooting, auditing, or recovery.
 - **Audit records:** Follow any longer organizational retention requirement separately from operational extraction logs.
 
+### Access procedure
+
+The database administrator must approve access before granting it. ETL operators need read access for monitoring; the extraction runtime needs permission to insert logs. Other application users must not receive access. Log setup restricts access to the table owner by default. Additional grants and any required row-level security policies must be limited to approved database roles and verified using those roles. Review access when a team member changes responsibilities or leaves the project.
+
+### Archive procedure
+
+Archiving is performed only when needed; keeping logs in the original table is acceptable. Before archiving, the database administrator must identify the affected run IDs and check for open troubleshooting, audit, or recovery work with the ETL operator or data owner. Copy the complete log records into restricted archive storage within PostgreSQL, then verify row counts, run IDs, timestamps, validation results, and errors. Record the archive location, date, responsible administrator, and verification result in the approved maintenance record. An archive copy must follow the same access and retention rules. Archiving does not authorize deletion or shorten retention.
+
+### Review and deletion procedure
+
+1. The database administrator identifies logs that have completed the one-year retention period. Pending local logs are not eligible until their database delivery is confirmed.
+2. The ETL operator or data owner confirms that the selected run IDs are no longer needed for troubleshooting, auditing, or recovery. If that confirmation is unavailable, retain the logs and review them later.
+3. Record the run IDs, row count, retention dates, reason, approval, and responsible administrator in the approved maintenance record before deletion. Include any archive location and verification result.
+4. The database administrator deletes only the approved records in a transaction, checks the affected count, and rolls back if it differs from the approved count. Retention protection must not be disabled to bypass the minimum period.
+5. Record the completion time and actual deleted count, or the rollback outcome. Keep the maintenance record under the applicable audit retention policy, separately from the deleted operational logs.
+
+The retention trigger enforces the minimum age; it does not determine whether a run is still under investigation. The review and approval steps remain mandatory even when the trigger allows deletion.
+
 ## 6. Extraction Data Contract and Naming Convention
 
 ### Required schema and naming
