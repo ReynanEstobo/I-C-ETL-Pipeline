@@ -139,18 +139,94 @@ def extract_source():
         ) from None
 
 
+def validate_staged_data(connection: psycopg.Connection) -> dict:
+    """Run issue #3 checks in SQL; return counts and statuses, never records.
+
+    Call inside extract_source() so source counts and stages share a snapshot.
+    Nullable dates/references are warnings, not repaired or removed here.
+    """
+    checks = []
+    with connection.cursor() as cursor:
+        def record(table, name, query, warning=False):
+            cursor.execute(query)
+            affected = cursor.fetchone()[0]
+            status = ('WARNING' if warning else 'FAIL') if affected else 'PASS'
+            checks.append({
+                'table': table, 'check': name, 'status': status,
+                'affected_rows': affected,
+            })
+
+        for table in SOURCE_COLUMNS:
+            stage = sql.Identifier('pg_temp', 'stage_' + table)
+            record(table, 'row_count', sql.SQL(
+                'SELECT abs((SELECT count(*) FROM {}) - (SELECT count(*) FROM {}))'
+            ).format(sql.Identifier('public', table), stage))
+            columns = ['id', 'order_number'] if table == 'orders' else ['id']
+            for column in columns:
+                field = sql.Identifier(column)
+                record(table, column + '_present', sql.SQL(
+                    'SELECT count(*) FROM {} WHERE {} IS NULL'
+                ).format(stage, field))
+                record(table, column + '_unique', sql.SQL(
+                    'SELECT count({}) - count(DISTINCT {}) FROM {}'
+                ).format(field, field, stage))
+
+        for table, column, parent, nullable in [
+            ('orders', 'branch_id', 'branches', True),
+            ('orders', 'customer_id', 'customers', True),
+            ('payments', 'branch_id', 'branches', True),
+            ('payments', 'order_id', 'orders', False),
+            ('expenses', 'branch_id', 'branches', True),
+        ]:
+            stage = sql.Identifier('pg_temp', 'stage_' + table)
+            field = sql.Identifier(column)
+            record(table, column + '_present', sql.SQL(
+                'SELECT count(*) FROM {} WHERE {} IS NULL'
+            ).format(stage, field), warning=nullable)
+            record(table, column + '_reference', sql.SQL(
+                'SELECT count(*) FROM {} AS child '
+                'WHERE child.{} IS NOT NULL AND NOT EXISTS '
+                '(SELECT 1 FROM {} AS parent WHERE parent.id = child.{})'
+            ).format(stage, field, sql.Identifier('pg_temp', 'stage_' + parent), field))
+
+        for table, column, nullable in [
+            ('orders', 'created_at', True),
+            ('payments', 'paid_at', False),
+            ('expenses', 'expense_date', False),
+        ]:
+            stage = sql.Identifier('pg_temp', 'stage_' + table)
+            field = sql.Identifier(column)
+            record(table, column + '_present', sql.SQL(
+                'SELECT count(*) FROM {} WHERE {} IS NULL'
+            ).format(stage, field), warning=nullable)
+            # PostgreSQL types already reject malformed dates. Infinity is
+            # valid PostgreSQL syntax but cannot identify a reporting date.
+            record(table, column + '_valid', sql.SQL(
+                'SELECT count(*) FROM {} WHERE {} IS NOT NULL AND NOT isfinite({})'
+            ).format(stage, field, field))
+
+    statuses = {check['status'] for check in checks}
+    overall = 'FAIL' if 'FAIL' in statuses else 'WARNING' if 'WARNING' in statuses else 'PASS'
+    return {'status': overall, 'checks': checks}
+
+
 def main() -> int:
     try:
-        with extract_source() as (_, counts):
+        with extract_source() as (connection, counts):
             print('Extraction completed from one read-only snapshot.')
             for table, count in counts.items():
                 print(f'stage_{table}: {count} rows')
-            print('Records stayed in PostgreSQL temporary tables; Python read only counts.')
+            results = validate_staged_data(connection)
+            for check in results['checks']:
+                print(f"{check['status']}: {check['table']}.{check['check']} "
+                      f"(affected rows: {check['affected_rows']})")
+            print(f"Overall validation: {results['status']}")
+            print('Records stayed in PostgreSQL; Python read only counts and check results.')
         print('Connection closed. Temporary staging tables were removed.')
     except (ExtractionError, SourceConnectionError) as error:
         print(error)
         return 1
-    return 0
+    return 1 if results['status'] == 'FAIL' else 0
 
 
 if __name__ == '__main__':
