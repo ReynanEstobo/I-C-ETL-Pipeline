@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from time import perf_counter, sleep
 from uuid import uuid4
 import sys
+import csv
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 
 import psycopg
 from psycopg import sql
@@ -18,6 +24,7 @@ from pipeline.connection import (
 # Shared lock identity for every manual and future scheduled extraction.
 # Both values fit PostgreSQL's two-integer advisory-lock signature.
 EXTRACTION_LOCK_KEY = (18755, 1163152460)
+PENDING_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / '.pending-extraction-logs'
 
 
 # PostgreSQL's internal type names, in the output column order.
@@ -403,7 +410,7 @@ def handover_extraction(connection, run_id, started, counts, results, consumer,
     return acknowledgment
 
 
-def save_extraction_logs(run_id, started, ended, duration, source_counts,
+def write_database_logs(run_id, started, ended, duration, source_counts,
                          staged_counts, results, error_code=None, error_message=None):
     """Commit only metadata on a separate connection after extraction ends."""
     with connect_source() as connection:
@@ -425,11 +432,83 @@ def save_extraction_logs(run_id, started, ended, duration, source_counts,
                         validation_results, error_code, error_message, duration_ms,
                         acceptance_status
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (pipeline_run_id, table_name) DO NOTHING
                 ''', (run_id, 'public.' + table, started, ended, status,
                       source_counts.get(table), staged_counts.get(table),
                       'All available history', Jsonb(details), error_code,
                       error_message, duration,
                       acceptance_decision(results, failed=bool(error_code))))
+
+
+def private_pending_directory():
+    """Restrict pending metadata to the operating-system user running Python."""
+    directory = PENDING_LOG_DIRECTORY
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == 'nt':
+        identity = subprocess.run(
+            ['whoami', '/user', '/fo', 'csv', '/nh'],
+            capture_output=True, text=True, check=True,
+        )
+        sid = next(csv.reader([identity.stdout.strip()]))[1]
+        subprocess.run(
+            ['icacls', str(directory), '/inheritance:r', '/grant:r',
+             f'*{sid}:(OI)(CI)F'],
+            capture_output=True, check=True,
+        )
+    else:
+        directory.chmod(0o700)
+    return directory
+
+
+def flush_pending_logs():
+    """Replay durable metadata; only delete entries after the DB commit returns."""
+    if not PENDING_LOG_DIRECTORY.exists():
+        return 0
+    directory = private_pending_directory()
+    saved = 0
+    for path in sorted(directory.glob('*.json')):
+        with path.open(encoding='utf-8') as handle:
+            entry = json.load(handle)
+        write_database_logs(
+            uuid4_from_text(entry['run_id']),
+            datetime.fromisoformat(entry['started']),
+            datetime.fromisoformat(entry['ended']), entry['duration'],
+            entry['source_counts'], entry['staged_counts'], entry['results'],
+            entry['error_code'], entry['error_message'],
+        )
+        path.unlink(missing_ok=True)
+        saved += 1
+    return saved
+
+
+def uuid4_from_text(value):
+    """Parse an existing run ID without assigning a new identity during replay."""
+    from uuid import UUID
+    return UUID(value)
+
+
+def save_extraction_logs(run_id, started, ended, duration, source_counts,
+                         staged_counts, results, error_code=None, error_message=None):
+    """Durably queue metadata before attempting database delivery."""
+    directory = private_pending_directory()
+    entry = {
+        'run_id': str(run_id), 'started': started.isoformat(),
+        'ended': ended.isoformat(), 'duration': duration,
+        'source_counts': source_counts, 'staged_counts': staged_counts,
+        'results': results, 'error_code': error_code, 'error_message': error_message,
+    }
+    # Only counts/check results and fixed safe error messages enter this queue.
+    target = directory / (str(run_id) + '.json')
+    descriptor, temporary = tempfile.mkstemp(dir=directory, suffix='.tmp')
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            json.dump(entry, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    flush_pending_logs()
 
 
 def run_extraction_attempt(consumer=None, retry_state=None) -> int:
@@ -519,10 +598,11 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
     try:
         save_extraction_logs(run_id, started, ended, duration, source_counts,
                              staged_counts, results, error_code, error_message)
-    except (psycopg.Error, SourceConnectionError):
+    except (psycopg.Error, SourceConnectionError, OSError, ValueError, subprocess.SubprocessError):
         # Never start another extraction while this attempt's log is unsaved.
         retry_state['retryable'] = False
         print('Could not save extraction logs. The run is not fully logged.')
+        print('Check the private pending-log queue; queued entries remain until delivery succeeds.')
         print('Check log setup, permissions, and database connectivity before retrying.')
         print(f'Run ID: {run_id}; start: {started.isoformat()}; end: {ended.isoformat()}')
         return 1
@@ -532,6 +612,21 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
 
 def main(consumer=None) -> int:
     """Try at most three times, with a fresh UUID and snapshot per attempt."""
+    if sys.argv[1:] not in ([], ['--setup-logs'], ['--flush-logs']):
+        print('Usage: python -m pipeline.extraction [--setup-logs | --flush-logs]')
+        return 1
+    if sys.argv[1:] != ['--setup-logs']:
+        try:
+            saved = flush_pending_logs()
+        except (psycopg.Error, SourceConnectionError, OSError, ValueError,
+                KeyError, subprocess.SubprocessError):
+            print('Pending logs could not be delivered. Entries were retained; extraction did not start.')
+            return 1
+        if saved:
+            print(f'Recovered {saved} pending extraction log entries.')
+        if sys.argv[1:] == ['--flush-logs']:
+            print('Pending-log delivery completed.')
+            return 0
     for attempt in range(1, 4):
         retry_state = {}
         code = run_extraction_attempt(consumer, retry_state)

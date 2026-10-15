@@ -95,11 +95,14 @@ Capture one run-start timestamp for the source snapshot and link table logs usin
 
 Store logs in a restricted ETL operations table in the same PostgreSQL database, separate from `public` source records. During manual runs, Python must display staged counts and validation results. Failure logs must survive rollback of the extraction transaction. A separate logging transaction must store only run metadata, validation results, and error details; it must not extract or process source records. If the database is unavailable, record the failure once connectivity is restored, using the original run ID and timestamps.
 
+The Python wrapper must keep undelivered log metadata in a private local `.pending-extraction-logs` directory so it survives restarts. This queue must contain no credentials or extracted source records and must be excluded from Git. Replay pending entries before the next extraction, or with `python -m pipeline.extraction --flush-logs`. Keep original run IDs and timestamps, prevent duplicate database entries, and remove a queued entry only after its database transaction commits. The queue is temporary metadata storage, not an extraction staging store.
+
 ## 5. Log Retention and Access
 
 - **Retention:** Keep extraction logs for at least one year to investigate failed runs, historical corrections, and reporting discrepancies.
 - **Storage:** Use the restricted ETL operations log table in the existing PostgreSQL database. Temporary staging is not a log store.
 - **Access:** Allow authorized ETL operators and database administrators to read logs. Restrict log writes and source credentials to authorized runtimes and administrators.
+- **Pending logs:** Restrict the local queue to the operating-system account running the wrapper. Retain undelivered entries until database storage is confirmed; the one-year retention period applies to the saved database logs.
 - **Archiving:** Archive older logs within restricted PostgreSQL storage when needed, retaining run IDs, timestamps, results, and errors.
 - **Deletion:** An authorized database administrator checks retention and open investigations, then records any deletion. Never delete logs before one year or while needed for troubleshooting, auditing, or recovery.
 - **Audit records:** Follow any longer organizational retention requirement separately from operational extraction logs.
