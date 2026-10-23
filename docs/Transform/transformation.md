@@ -164,3 +164,26 @@ Never join raw orders, payments, and expenses together for aggregation. Each str
 No surrogate keys, dimension tables, or slowly changing dimensions are introduced. Branch IDs remain the grouping keys; labels come from staged branch references.
 
 Assign each input row one accounting category in this order: rejected, business-excluded, deferred, or contributing. Record additional matched reasons separately without double-counting exclusions. Preserve counts and source identifiers for traceability.
+
+## 6. Transformed Data Contract and Naming Convention
+
+The Load Stage receives `pg_temp.transformed_daily_branch_summary` in the active connection. All fields below are NOT NULL. The composite key is `(report_date, branch_id)`; branch IDs must resolve to staged branches.
+
+| Output column | Type | Source-to-target mapping |
+| --- | --- | --- |
+| report_date | DATE | Union of eligible order, payment, and expense business dates |
+| branch_id | UUID | Branch key from each independent aggregate |
+| order_count | BIGINT | Count of B-04 eligible orders, otherwise 0 |
+| released_order_count | BIGINT | B-04 count of eligible released orders, otherwise 0 |
+| unique_customer_count | BIGINT | B-04 distinct customer IDs per group, otherwise 0 |
+| total_weight_kg | NUMERIC(14,2) | Rounded B-04 sum of weight_kg, otherwise 0 |
+| order_value_php | NUMERIC(14,2) | Rounded B-04 sum of total_price, otherwise 0 |
+| payment_count | BIGINT | Count of B-05 payments, otherwise 0 |
+| cash_received_php | NUMERIC(14,2) | Rounded B-05 sum of amount, otherwise 0 |
+| expense_total_php | NUMERIC(14,2) | Rounded B-06 sum of amount, otherwise 0 |
+
+Use lowercase snake_case for tables and columns. Retain branch_id as the UUID key; do not introduce a branch surrogate key. Validate uniqueness and required values before handover.
+
+The permanent destination remains `analytics.daily_branch_summary`. The Load Stage supplies `refreshed_at` when publication succeeds; transformation completion time is recorded separately in metadata.
+
+Input schema must match the Stage 1 contract. Missing required fields or incompatible types stop the batch. Additional unused fields do not alter transformation output. Version any intentional input mapping or output schema change and verify Load compatibility before deployment.
