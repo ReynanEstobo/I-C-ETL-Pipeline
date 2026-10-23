@@ -124,7 +124,7 @@ def check_source_access(connection: psycopg.Connection) -> None:
 
 
 @contextmanager
-def extract_source(source_counts=None, staged_counts=None, run_checks=None):
+def extract_source(source_counts=None, staged_counts=None, run_checks=None, prepare=None):
     """Stage source rows in SQL and yield the connection and row counts.
 
     Stages remain available inside this context only. Future SQL validation
@@ -151,6 +151,9 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None):
                                 sql.Identifier('stage_' + table), definitions
                             )
                         )
+
+                    if prepare is not None:
+                        prepare(connection)
 
             connection.read_only = True
             connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
@@ -552,7 +555,8 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
     error_code = error_message = None
     print(f'Run ID: {run_id}')
     try:
-        with extract_source(source_counts, staged_counts, run_checks) as (connection, counts):
+        with extract_source(source_counts, staged_counts, run_checks,
+                            prepare=getattr(consumer, 'prepare', None)) as (connection, counts):
             print('Extraction completed from one read-only snapshot.')
             for table, count in counts.items():
                 print(f'stage_{table}: {count} rows')

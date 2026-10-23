@@ -107,6 +107,12 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
         ))
 
     validations = []
+    stages.append(sql.SQL('''
+        IF to_regprocedure('etl_ops.prepare_transformation()') IS NOT NULL THEN
+            PERFORM etl_ops.recover_transformation_logs();
+            PERFORM etl_ops.prepare_transformation();
+        END IF;
+    '''))
     for table, name, query, warning in validation_queries(source_schema):
         validations.append(sql.SQL('{} INTO affected;').format(query))
         status = "CASE WHEN affected = 0 THEN 'PASS' ELSE '{}' END".format(
@@ -169,6 +175,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                 staged_counts := '{{}}'::jsonb;
                 failure_code := NULL;
                 failure_message := NULL;
+                receiver_result := NULL;
                 failure_state := NULL;
                 may_retry := false;
                 overall := 'PASS';
@@ -323,6 +330,9 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                 COMMIT;
 
                 -- Permanent writes occur only after the source snapshot ends.
+                IF receiver_result ? 'transformation_run' THEN
+                    PERFORM etl_ops.queue_transformation_log(receiver_result->'transformation_run');
+                END IF;
                 FOR table_entry IN SELECT * FROM jsonb_each(expected) LOOP
                     SELECT CASE WHEN bool_or(c->>'status' = 'FAIL') THEN 'FAIL'
                                 WHEN bool_or(c->>'status' = 'WARNING') THEN 'WARNING'
@@ -348,6 +358,9 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                 END LOOP;
                 -- Queue metadata durably before attempting final-log delivery.
                 COMMIT;
+                IF to_regprocedure('etl_ops.recover_transformation_logs()') IS NOT NULL THEN
+                    PERFORM etl_ops.recover_transformation_logs();
+                END IF;
                 PERFORM etl_ops.recover_extraction_logs(run_id);
                 SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
                 COMMIT;
@@ -358,6 +371,9 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                     COMMIT;
                     IF overall = 'FAIL' THEN
                         RAISE EXCEPTION 'Scheduled extraction rejected; inspect etl_ops.extraction_logs';
+                    END IF;
+                    IF receiver_result->'transformation_run'->>'status' = 'FAIL' THEN
+                        RAISE EXCEPTION 'Scheduled transformation rejected; inspect etl_ops.transformation_logs';
                     END IF;
                     RETURN;
                 END IF;

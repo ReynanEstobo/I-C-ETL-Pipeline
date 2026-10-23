@@ -84,34 +84,36 @@ The affected count for each listed extraction check was zero. Label quality, sta
 
 ### Transformation profiling register
 
-Profiling run `0a14a5a5-01ba-4d58-a2dd-051651a0a8e6` executed on 2026-10-23 at 13:28:48 Asia/Manila through the approved extraction handover using `python -m pipeline.profiling`. It measured 3 branches, 3 customers, 4 orders, 4 payments, and 3 expenses. The reporting cutoff is 2026-10-23 in Asia/Manila.
+Profiling run `ab6ed3e7-e577-4325-a705-c7dedd349a71` executed on 2026-10-23 at 19:45:53 Asia/Manila through the approved extraction handover using `python -m pipeline.profiling`. It measured 3 branches, 3 customers, 4 orders, 4 payments, and 3 expenses. The reporting cutoff is 2026-10-23 in Asia/Manila.
 
 | Measured check | Result | Treatment reference |
 | --- | --- | --- |
 | Missing/blank, surrounding whitespace, or control characters in branch labels | 0 of 3 (0%) for each check | C-01, C-02; preventive controls |
 | Order status distribution | cancelled, ready, received, released: 1 of 4 (25%) each | S-03, B-02, B-04 |
+| Missing/blank, surrounding whitespace, or inconsistent case in order status | 0 of 4 (0%) for each check | C-01, C-02, S-03 |
 | Negative order weight or value, missing weight/value, non-finite weight/value | 0 of 4 (0%) for each check | C-03, C-04, C-08 |
 | Negative, missing, or non-finite payment amount | 0 of 4 (0%) for each check | C-03, C-08 |
 | Negative, missing, or non-finite expense amount | 0 of 3 (0%) for each check | C-03, C-08 |
+| Numeric ranges | Orders: 8-12 kg and PHP 200-300; payments: PHP 100-300; expenses: PHP 150-450 | Review finite ranges when larger source volumes are available |
+| Business dates and cutoff | Orders and payments: 2026-10-12 to 2026-10-13, 4 before cutoff, 0 on, 0 after; expenses: 2026-10-12 to 2026-10-13, 3 before cutoff, 0 on, 0 after | S-01, S-02, B-01 |
+| Cancelled orders | 1 of 4 (25%); 8 kg and PHP 200 order value | B-02; business exclusion |
 | Soft-deleted expenses | 1 of 3 (33.33%) | B-03; business exclusion |
 | Payment/order branch mismatch | 0 of 4 payments (0%) | C-07 |
 | Multiple payments per order | 1 of 3 paid orders (33.33%) has 2 payments; the other 2 have 1 each | B-05; preserve all distinct payment records |
 
-Date distributions, numeric ranges, and detailed status-format checks still require measurement. The register below retains the remaining profiling specification; illustrative values are not measured defects.
-
-The following register defines the transformation profiling checks. Measurements are pending. Example values describe the check conditions and are not recorded findings. Completed profiles must include measured counts and sanitized observed values.
+The following register records the measured findings for the approved profiling run. The values are specific to that run and must be measured again when the source data changes materially.
 
 | Table and column | Issue or characteristic to inspect | Illustrative sample | Affected records | Planned treatment |
 | --- | --- | --- | --- | --- |
-| `stage_branches.branch_name` | NULL or blank labels, leading/trailing whitespace, and control characters | ` Main `, empty text | Pending measurement | Section 3: define label cleaning and treatment of unusable labels. |
-| `stage_orders.status` | NULL or blank statuses, inconsistent case/spacing, and distinct status values | `Released`, ` released ` | Pending measurement | Section 4: define standard values from the observed vocabulary and approved business meanings. |
-| `stage_orders.weight_kg`, `stage_orders.total_price` | NULL, negative, non-finite, or unusually large values | `-1`, `NaN` | Pending measurement | Section 3: define invalid-value handling; Section 4: define numeric precision. Review unusual finite values before classifying them as errors. |
-| `stage_payments.amount`, `stage_expenses.amount` | NULL, negative, non-finite, or unusually large amounts | `-25`, `Infinity` | Pending measurement | Section 3: establish valid amount ranges and treatment with the data owner; do not assume a negative amount is an authorized refund. |
-| `stage_orders.created_at`, `stage_payments.paid_at`, `stage_expenses.expense_date` | Earliest/latest business dates and counts before, on, or after the reporting cutoff | Business date equal to cutoff | Pending measurement | Section 4: define Manila date standardization; Section 5: apply the completed-day reporting window and count deferred records. |
-| `stage_orders.status` | Number of cancelled orders and their associated values | `cancelled`, if present | Pending measurement | Section 5: define order eligibility and record business exclusions. Confirm the actual cancellation code and policy first. |
-| `stage_expenses.deleted_at` | Number and amount of soft-deleted expenses | Non-NULL deletion timestamp | Pending measurement | Section 5: exclude soft-deleted expenses from reporting and record the excluded count. |
-| `stage_payments.branch_id`, linked `stage_orders.branch_id` | Different valid branches on a payment and its order | Two different branch IDs | Pending measurement | Section 5: document collection attribution after reviewing whether cross-branch payments are valid business activity. |
-| `stage_payments.order_id` | Distribution of payment rows per order | Two payments linked to one order | Pending measurement | Section 5: aggregate payments independently; repeated order references are not duplicate payment records. |
+| `stage_branches.branch_name` | NULL or blank labels, leading/trailing whitespace, and control characters | No affected labels | 0 of 3 (0%) for each check | Section 3: retain preventive label-cleaning controls. |
+| `stage_orders.status` | NULL or blank statuses, inconsistent case/spacing, and distinct status values | cancelled, ready, received, released | 0 of 4 (0%) formatting issues; each status occurs once | Section 4: retain the approved lowercase status mapping. |
+| `stage_orders.weight_kg`, `stage_orders.total_price` | NULL, negative, non-finite, or unusually large values | Weight: 8-12 kg; value: PHP 200-300 | 0 of 4 (0%) invalid values | Section 3: retain invalid-value handling; Section 4: retain NUMERIC precision. |
+| `stage_payments.amount`, `stage_expenses.amount` | NULL, negative, non-finite, or unusually large amounts | Payments: PHP 100-300; expenses: PHP 150-450 | 0 of 4 payments and 0 of 3 expenses invalid | Section 3: retain amount controls and re-profile as volume grows. |
+| `stage_orders.created_at`, `stage_payments.paid_at`, `stage_expenses.expense_date` | Earliest/latest business dates and counts before, on, or after the reporting cutoff | 2026-10-12 to 2026-10-13 | Orders: 4/0/0; payments: 4/0/0; expenses: 3/0/0 before/on/after cutoff | Section 4: apply Manila dates; Section 5: apply the completed-day window. |
+| `stage_orders.status` | Number of cancelled orders and their associated values | One cancelled order: 8 kg, PHP 200 | 1 of 4 (25%) | Section 5: exclude it from order measures under B-02. |
+| `stage_expenses.deleted_at` | Number of soft-deleted expenses | One non-NULL deletion timestamp | 1 of 3 (33.33%) | Section 5: exclude it from reporting under B-03. |
+| `stage_payments.branch_id`, linked `stage_orders.branch_id` | Different valid branches on a payment and its order | No mismatched pair | 0 of 4 payments (0%) | Section 5: retain C-07 review control. |
+| `stage_payments.order_id` | Distribution of payment rows per order | One order has two payments | 1 of 3 paid orders (33.33%) has two payments; two have one each | Section 5: aggregate distinct payment rows independently. |
 
 Business exclusions, date-window deferrals, and multiple payments per order are distinct from data quality errors. Profiling must preserve all staged records. Each observed issue must reference its cleaning, standardization, or business rule in Sections 3, 4, or 5. A completed profile must contain measured findings and planned treatments for an identified batch.
 
@@ -128,7 +130,8 @@ Cleaning must operate on temporary working copies and preserve raw staging. The 
 | C-05 | IDs and order numbers | Duplicate identifier in working data | Reject the batch; retain neither row as an arbitrary winner | No extracted update timestamp establishes which version is authoritative |
 | C-06 | Required references and dates | Missing value or unmatched staged parent | Reject and log; do not substitute a default | Prevent incorrect branch, customer, order, or date attribution |
 | C-07 | Payment branch versus order branch | Different valid branch IDs | Hold for review without overwriting either value | Cross-branch collection handling requires an approved business rule |
-| C-08 | Order value, payment amount, and expense amount | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
+| C-08 | Order value and expense amount | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
+| C-09 | Payment amount | Zero or negative value | Reject and log | The source schema requires payment amount greater than zero |
 
 Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. No automatic duplicate removal is permitted without a documented selection rule.
 
@@ -152,7 +155,7 @@ Standardization must preserve business meaning and operate on the cleaned workin
 
 Currency is PHP and weight is kilograms. No currency or unit conversion is performed. Numeric source values are already typed; do not convert through floating-point arithmetic or formatted currency strings.
 
-The allowed status list must be established from the measured vocabulary and confirmed business meanings. Case and whitespace normalization does not authorize mapping an unfamiliar status to an existing code. Record the mapping version and changed-row counts.
+Rule version `1.0.0` recognizes the source schema's codes `received`, `on_process`, `ready`, `released`, and `cancelled`. The first four contribute to eligible order measures; `released` also contributes to released-order counts. Cancelled orders are excluded from order measures. Case and whitespace normalization does not authorize mapping unfamiliar codes to existing statuses. Unknown statuses hold the batch for review. Record the mapping version and changed-row counts.
 
 Rounding must occur after aggregation, not once per source row. Validate the rounded result before casting to NUMERIC(14,2). Conversion failures must be logged with the rule ID and affected record or group; they must not become silent NULLs or zeroes.
 
