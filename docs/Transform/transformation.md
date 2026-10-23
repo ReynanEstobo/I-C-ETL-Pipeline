@@ -28,7 +28,7 @@ Transformation must read the supplied staging tables, not re-extract records fro
 
 ### Batch processing method
 
-SQL will perform profiling, cleaning, standardization, business calculations, and validation inside PostgreSQL. Records must remain in the database. Transformation must use working copies or derived temporary outputs while preserving the raw extraction stages.
+SQL will perform profiling, cleaning, standardization, business calculations, and validation inside PostgreSQL. Records must remain in the database. Transformation must use working copies or derived temporary outputs while preserving the raw extraction stages. Create empty temporary working and output tables during the setup transaction before the read-only extraction snapshot begins; populate and update them within the shared snapshot. Do not create these tables inside the read-only transaction.
 
 The batch must run daily immediately after approved extraction in the **01:00 Asia/Manila** pipeline execution. It must use the active extraction handover rather than a separately scheduled connection, because temporary staging is session-local.
 
@@ -84,6 +84,21 @@ The affected count for each listed extraction check was zero. Label quality, sta
 
 ### Transformation profiling register
 
+Profiling run `0a14a5a5-01ba-4d58-a2dd-051651a0a8e6` executed on 2026-10-23 at 13:28:48 Asia/Manila through the approved extraction handover using `python -m pipeline.profiling`. It measured 3 branches, 3 customers, 4 orders, 4 payments, and 3 expenses. The reporting cutoff is 2026-10-23 in Asia/Manila.
+
+| Measured check | Result | Treatment reference |
+| --- | --- | --- |
+| Missing/blank, surrounding whitespace, or control characters in branch labels | 0 of 3 (0%) for each check | C-01, C-02; preventive controls |
+| Order status distribution | cancelled, ready, received, released: 1 of 4 (25%) each | S-03, B-02, B-04 |
+| Negative order weight or value, missing weight/value, non-finite weight/value | 0 of 4 (0%) for each check | C-03, C-04, C-08 |
+| Negative, missing, or non-finite payment amount | 0 of 4 (0%) for each check | C-03, C-08 |
+| Negative, missing, or non-finite expense amount | 0 of 3 (0%) for each check | C-03, C-08 |
+| Soft-deleted expenses | 1 of 3 (33.33%) | B-03; business exclusion |
+| Payment/order branch mismatch | 0 of 4 payments (0%) | C-07 |
+| Multiple payments per order | 1 of 3 paid orders (33.33%) has 2 payments; the other 2 have 1 each | B-05; preserve all distinct payment records |
+
+Date distributions, numeric ranges, and detailed status-format checks still require measurement. The register below retains the remaining profiling specification; illustrative values are not measured defects.
+
 The following register defines the transformation profiling checks. Measurements are pending. Example values describe the check conditions and are not recorded findings. Completed profiles must include measured counts and sanitized observed values.
 
 | Table and column | Issue or characteristic to inspect | Illustrative sample | Affected records | Planned treatment |
@@ -109,10 +124,11 @@ Cleaning must operate on temporary working copies and preserve raw staging. The 
 | C-01 | Branch labels and order statuses | Leading or trailing whitespace | Trim working values; count changed rows | Prevent formatting differences from affecting labels or status mapping |
 | C-02 | Required labels and statuses | NULL, blank after trimming, or embedded control characters | Reject and log; stop batch approval | No reliable replacement can be inferred |
 | C-03 | Weight and monetary fields | NULL or non-finite numeric value | Reject and log | These values cannot support valid reporting totals |
-| C-04 | Weight and monetary fields | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Negative weights are invalid; refund or adjustment handling must be established before interpreting negative amounts |
+| C-04 | Order weight | Negative value | Reject and log; stop batch approval | Negative weight cannot represent laundry demand |
 | C-05 | IDs and order numbers | Duplicate identifier in working data | Reject the batch; retain neither row as an arbitrary winner | No extracted update timestamp establishes which version is authoritative |
 | C-06 | Required references and dates | Missing value or unmatched staged parent | Reject and log; do not substitute a default | Prevent incorrect branch, customer, order, or date attribution |
 | C-07 | Payment branch versus order branch | Different valid branch IDs | Hold for review without overwriting either value | Cross-branch collection handling requires an approved business rule |
+| C-08 | Order value, payment amount, and expense amount | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
 
 Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. No automatic duplicate removal is permitted without a documented selection rule.
 
@@ -204,8 +220,8 @@ Validation must assess transformed data and its contributing staged records. It 
 | Count reconciliation | Order and payment counts | Per-group counts equal contributing inputs; released and distinct customer counts recompute correctly | Critical |
 | Measure reconciliation | Weight, order value, collections, expenses | Each group equals its exact contributing sum rounded under S-05 | Critical |
 | Count relationships | Order measures | released_order_count and unique_customer_count do not exceed order_count | Critical |
-| Numeric validity | Output measures | Finite and within range; negative values have no unresolved policy or validation issue | Critical |
-| Policy review | Status and branch attribution | No unresolved status mapping or cross-branch decision | Warning; blocks automatic handover |
+| Numeric validity | Output measures | Counts and weight are nonnegative; all measures are finite and within range; monetary signs comply with the approved rule version | Critical |
+| Policy review | Status, monetary signs, and branch attribution | No unresolved status mapping, negative-amount policy, or cross-branch decision | Warning; blocks automatic handover |
 | Empty reporting output | Full-history batch | Empty eligible history explicitly reviewed before replacement loading | Warning; blocks automatic handover |
 
 Modified retained rows are not an extra term in the row-accounting equation. A row can match several rules but belongs to only one final accounting category.
@@ -231,6 +247,7 @@ Store transformation metadata in restricted `etl_ops.transformation_logs`. Keep 
 | transformation_started_at, transformation_ended_at | TIMESTAMPTZ execution boundaries |
 | transformation_status | PASS, WARNING, or FAIL |
 | acceptance_status | APPROVED, MANUAL REVIEW, or REJECTED |
+| log_delivery_status | PENDING, SAVED, or FAILED; separate from the data acceptance decision |
 | records_read, records_output | Received and produced row counts at the stated grain |
 | records_rejected | Distinct rejected rows |
 | records_excluded, records_deferred, records_contributing | Exclusive row-accounting totals |
@@ -245,7 +262,9 @@ Use metadata for monitoring, rule impact analysis, lineage, troubleshooting, and
 
 Failure evidence must survive rollback. The orchestration layer must capture diagnostics before ending the processing transaction and persist them through a separate authorized logging transaction afterward. Permanent writes must not be attempted inside the existing read-only extraction transaction.
 
-Undelivered metadata must remain in a restricted pending store until delivery commits. Replay must preserve original run IDs and timestamps and avoid duplicate entries. If a connection fails before diagnostic evidence is durably captured, record incomplete logging and inspect available scheduler/service evidence; do not claim guaranteed recovery. A batch with incomplete required logs must not be reported as fully accepted.
+Undelivered metadata must remain in a restricted pending store until delivery commits. Replay must preserve original run IDs and timestamps and avoid duplicate entries. If a connection fails before diagnostic evidence is durably captured, record incomplete logging and inspect available scheduler/service evidence; do not claim guaranteed recovery.
+
+Keep data acceptance separate from log-delivery status. Validation determines whether temporary output may be handed over while the transaction is active. Final-log persistence is confirmed after that transaction ends. Record log delivery as PENDING, SAVED, or FAILED, and do not report the run as fully logged until delivery is SAVED. A logging failure must not trigger an automatic repeat of a downstream operation that may already have completed.
 
 ## 9. Log Retention, Rejected Data, and Access
 
@@ -275,9 +294,9 @@ Calculate the rejection rate from distinct rejected transaction rows divided by 
 
 | Validation condition | Acceptance | Pipeline action | Decision and responsibility |
 | --- | --- | --- | --- |
-| All critical checks pass; zero rejected rows; no unresolved warnings; required logs complete | APPROVED | Offer validated output to Load | Automatic |
-| No critical failure, but unresolved status/branch policy or empty-output warning | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
-| Any critical failure, rejected row, incompatible contract, or incomplete required evidence | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
+| All critical checks pass; zero rejected rows; no unresolved warnings; required validation and handover metadata captured | APPROVED | Offer validated output to Load; finalize persistent logging after the transaction ends | Automatic |
+| No critical failure, but unresolved status, negative-amount, or branch policy, or an empty-output warning | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
+| Any critical failure, rejected row, incompatible contract, or missing required validation or handover metadata | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
 
 Manual review must resolve the issue or establish a versioned approved policy before a new batch is evaluated. Review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution.
 
@@ -286,6 +305,8 @@ Retry transient operational failures with a new attempt and linked run IDs. Do n
 Handover must include the temporary output reference, transformation run ID, parent extraction run ID, batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
 
 Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone must not be recorded as successful publication. Load owns permanent writes and publication acceptance; integration must resolve the transaction dependency identified in Section 1.
+
+Persistent log-delivery failure is an operational failure recorded separately under Section 8. It does not retroactively change calculated validation results or authorize replay of a completed Load operation. Recover undelivered logs before treating the run as operationally complete.
 
 ## 11. Common Transformation Problems and Mitigation
 
