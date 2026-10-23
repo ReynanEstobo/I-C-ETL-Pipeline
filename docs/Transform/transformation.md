@@ -187,3 +187,31 @@ Use lowercase snake_case for tables and columns. Retain branch_id as the UUID ke
 The permanent destination remains `analytics.daily_branch_summary`. The Load Stage supplies `refreshed_at` when publication succeeds; transformation completion time is recorded separately in metadata.
 
 Input schema must match the Stage 1 contract. Missing required fields or incompatible types stop the batch. Additional unused fields do not alter transformation output. Version any intentional input mapping or output schema change and verify Load compatibility before deployment.
+
+## 7. Transformation Validation and Data Quality Checks
+
+Validation must assess transformed data and its contributing staged records. It must not repeat source connectivity or extraction execution checks.
+
+| Check | Target and purpose | Passing criterion | Severity |
+| --- | --- | --- | --- |
+| Row accounting | Each transaction stream; detect unexplained losses | received = rejected + business_excluded + deferred + contributing | Critical |
+| Reference accounting | Branch/customer working rows | received = retained + rejected | Critical |
+| Join cardinality | Fact lookups and aggregate joins | Required lookup matches exactly once; joins do not multiply rows | Critical |
+| Output key coverage | Combined aggregate | Keys equal the union of eligible stream keys; no duplicates | Critical |
+| Required fields and types | Output contract | No NULL required fields; all values conform to Section 6 | Critical |
+| Branch integrity | Output branch_id | Every branch resolves to exactly one staged branch | Critical |
+| Reporting window | report_date | Every date precedes the captured cutoff | Critical |
+| Count reconciliation | Order and payment counts | Per-group counts equal contributing inputs; released and distinct customer counts recompute correctly | Critical |
+| Measure reconciliation | Weight, order value, collections, expenses | Each group equals its exact contributing sum rounded under S-05 | Critical |
+| Count relationships | Order measures | released_order_count and unique_customer_count do not exceed order_count | Critical |
+| Numeric validity | Output measures | Finite and within range; negative values have no unresolved policy or validation issue | Critical |
+| Policy review | Status and branch attribution | No unresolved status mapping or cross-branch decision | Warning; blocks automatic handover |
+| Empty reporting output | Full-history batch | Empty eligible history explicitly reviewed before replacement loading | Warning; blocks automatic handover |
+
+Modified retained rows are not an extra term in the row-accounting equation. A row can match several rules but belongs to only one final accounting category.
+
+Aggregate row count is not expected to equal input row count. Reconcile contributing rows and measures per stream and per date/branch. Distinct customer counts must be compared within each group rather than against one global distinct count.
+
+Compare rounded group sums with the same per-group rounding method. The sum of rounded groups may differ from a rounded grand total; record the difference without hiding a failed group check.
+
+Any critical failure rejects the batch. Warnings hold the batch for review under Section 10. Record expected values, actual values, affected counts, and check outcomes.
