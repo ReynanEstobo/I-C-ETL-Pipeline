@@ -286,3 +286,22 @@ Retry transient operational failures with a new attempt and linked run IDs. Do n
 Handover must include the temporary output reference, transformation run ID, parent extraction run ID, batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
 
 Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone must not be recorded as successful publication. Load owns permanent writes and publication acceptance; integration must resolve the transaction dependency identified in Section 1.
+
+## 11. Common Transformation Problems and Mitigation
+
+| Problem | Possible cause | Impact | Mitigation |
+| --- | --- | --- | --- |
+| Staging unavailable | Transformation starts in a separate session or after extraction commits | Batch cannot consume its approved inputs | Invoke through the active handover; restart extraction after session loss |
+| Inflated measures | Raw orders, payments, and expenses joined before grouping | Duplicated order value, collections, or expenses | Aggregate streams independently; verify join cardinality and group totals |
+| Wrong business date | UTC calendar date used directly or cutoff recalculated mid-run | Activity assigned to incorrect days | Apply Manila conversion and one captured cutoff; preserve expense DATE |
+| Missing historical changes | Only recent orders processed | Late payments or corrections absent from summaries | Rebuild completed-day history from full staged input |
+| Unknown status | Application introduces a code absent from approved mapping | Unclear eligibility or released-order counts | Hold batch, review observed values, version mapping, and rerun |
+| Negative amount or cross-branch collection | Refund/adjustment or collection practice not defined | Ambiguous financial attribution | Hold for owner review; establish explicit policy without guessing repairs |
+| Overflow or rounding discrepancy | Large totals or per-row rounding | Invalid target values or reconciliation failure | Sum exact NUMERIC values, round once per group, and validate target range |
+| Different results on rerun | Source corrections, changed statuses, or changed rules | Historical metrics change | Compare extraction run IDs, cutoff, and rule versions; verify identical-input determinism |
+| Empty completed-day output | No eligible history or unintended exclusions | Full-replacement loading could clear reports | Hold for review; verify exclusion counts and cutoff before approval |
+| Missing failure diagnostics | Connection ends before durable logging | Batch cannot be fully traced | Use pending metadata and replay; report incomplete evidence and inspect scheduler history |
+| Full-history processing slows | Source history grows | Transformation delays the daily pipeline | Monitor duration and contributing counts; review SQL plans and reassess batch design with reconciliation tests |
+| Permanent publication blocked | Existing extraction transaction is read-only | Load cannot write the target | Resolve orchestration transaction and role privileges before integrating Load; keep Stage 2 output temporary |
+
+Transformation must stop handover when mitigation requires a change to business rules, input contracts, or transaction design. Record the cause and applied correction, then validate a new batch before publication.
