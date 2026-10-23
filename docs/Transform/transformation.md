@@ -266,3 +266,23 @@ The runtime may write through authorized logging paths. Approved operators and a
 Archive older records within restricted PostgreSQL storage when needed. Verify counts, run IDs, reasons, and timestamps before treating an archive as complete. Archive copies remain subject to the original retention and access requirements.
 
 Before deletion, an administrator must confirm that the retention period has elapsed and the records are not needed for troubleshooting, audit, or recovery. Record the approval, run IDs, expected and actual counts, and outcome in a separate maintenance audit record. Pending entries must not be removed before successful delivery. Audit records follow their own applicable retention period.
+
+## 10. Transformation Acceptance and Handover Rules
+
+The rejection-rate threshold is **0%**, defined before processing. Daily financial summaries must not silently omit invalid contributing records. Business exclusions and date-window deferrals are not rejections.
+
+Calculate the rejection rate from distinct rejected transaction rows divided by received transaction rows. For an empty denominator, record the rate as not applicable and apply the empty-output review rule. Reference failures independently block acceptance.
+
+| Validation condition | Acceptance | Pipeline action | Decision and responsibility |
+| --- | --- | --- | --- |
+| All critical checks pass; zero rejected rows; no unresolved warnings; required logs complete | APPROVED | Offer validated output to Load | Automatic |
+| No critical failure, but unresolved status/branch policy or empty-output warning | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
+| Any critical failure, rejected row, incompatible contract, or incomplete required evidence | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
+
+Manual review must resolve the issue or establish a versioned approved policy before a new batch is evaluated. Review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution.
+
+Retry transient operational failures with a new attempt and linked run IDs. Do not automatically retry unresolved business or validation failures.
+
+Handover must include the temporary output reference, transformation run ID, parent extraction run ID, batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
+
+Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone must not be recorded as successful publication. Load owns permanent writes and publication acceptance; integration must resolve the transaction dependency identified in Section 1.
