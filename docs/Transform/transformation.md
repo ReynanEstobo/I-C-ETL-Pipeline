@@ -36,7 +36,7 @@ Each batch must process the full staged history and rebuild the eligible complet
 
 If transformation fails, stop handover to Load and discard incomplete transformed output. After the transaction ends, restart through the Extraction Stage to obtain a new approved snapshot and extraction run ID. Transformation must not attempt to reuse temporary tables from a closed connection.
 
-Reruns must be idempotent: the same staged input, reporting cutoff, and transformation rules must produce the same business rows without appending duplicates. A new extraction snapshot may legitimately change historical results when source records have been corrected.
+Reruns must be idempotent: the same staged input, reporting cutoff, and transformation rules must produce the same business rows without appending duplicates. At the start of each batch, the temporary working, issue, accounting, rule, and transformed-output tables are cleared before they are repopulated. A new extraction snapshot may legitimately change historical results when source records have been corrected.
 
 ### Transformation scope
 
@@ -119,7 +119,7 @@ Business exclusions, date-window deferrals, and multiple payments per order are 
 
 ## 3. Data Cleaning Rules
 
-Cleaning must operate on temporary working copies and preserve raw staging. The profiling categories in Section 2 identify the targets below; measured findings remain pending. Rule counts must distinguish changed, rejected, and retained rows.
+Cleaning must operate on temporary working copies and preserve raw staging. The measured profiling findings in Section 2 identify the targets below. Rule counts must distinguish changed, rejected, and retained rows.
 
 | Rule ID | Target | Condition | Action | Justification |
 | --- | --- | --- | --- | --- |
@@ -133,7 +133,7 @@ Cleaning must operate on temporary working copies and preserve raw staging. The 
 | C-08 | Order value and expense amount | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
 | C-09 | Payment amount | Zero or negative value | Reject and log | The source schema requires payment amount greater than zero |
 
-Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. No automatic duplicate removal is permitted without a documented selection rule.
+Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. When a duplicate identifier is found, no duplicate record is kept and the batch is rejected because the source provides no update timestamp for selecting an authoritative version.
 
 Unusually large finite values must be reviewed using measured profiles; no unverified threshold may silently remove them. Business exclusions such as deleted expenses belong to Section 5.
 
@@ -201,7 +201,7 @@ The Load Stage receives `pg_temp.transformed_daily_branch_summary` in the active
 | cash_received_php | NUMERIC(14,2) | Rounded B-05 sum of amount, otherwise 0 |
 | expense_total_php | NUMERIC(14,2) | Rounded B-06 sum of amount, otherwise 0 |
 
-Use lowercase snake_case for tables and columns. Retain branch_id as the UUID key; do not introduce a branch surrogate key. Validate uniqueness and required values before handover.
+Use lowercase snake_case for tables and columns. The `transformed_` prefix identifies temporary Stage 2 output, while `analytics.daily_branch_summary` is the permanent destination owned by Load. Retain branch_id as the UUID key; do not introduce a branch surrogate key. Validate uniqueness and required values before handover.
 
 The permanent destination remains `analytics.daily_branch_summary`. The Load Stage supplies `refreshed_at` when publication succeeds; transformation completion time is recorded separately in metadata.
 
