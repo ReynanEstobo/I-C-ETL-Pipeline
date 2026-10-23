@@ -246,3 +246,23 @@ Use metadata for monitoring, rule impact analysis, lineage, troubleshooting, and
 Failure evidence must survive rollback. The orchestration layer must capture diagnostics before ending the processing transaction and persist them through a separate authorized logging transaction afterward. Permanent writes must not be attempted inside the existing read-only extraction transaction.
 
 Undelivered metadata must remain in a restricted pending store until delivery commits. Replay must preserve original run IDs and timestamps and avoid duplicate entries. If a connection fails before diagnostic evidence is durably captured, record incomplete logging and inspect available scheduler/service evidence; do not claim guaranteed recovery. A batch with incomplete required logs must not be reported as fully accepted.
+
+## 9. Log Retention, Rejected Data, and Access
+
+Transformation logs and rejection evidence must be retained for at least one year to investigate historical report changes and failed batches. Longer organizational audit requirements take precedence.
+
+| Record | Storage | Contents and ownership |
+| --- | --- | --- |
+| Transformation logs | etl_ops.transformation_logs | Counts, rule actions, validation outcomes, decisions, and lineage; owned by authorized ETL operations role |
+| Rejection evidence | etl_ops.transformation_quarantine | Batch/run IDs, staged table, record UUID, rule IDs, reason, and minimal offending values; owned by authorized ETL operations role |
+| Pending metadata | Restricted orchestration pending store | Undelivered diagnostic metadata; retained until durable delivery is confirmed |
+
+Quarantine must contain only the fields needed to diagnose a failed transformation. Do not copy complete customer records or unnecessary sensitive data. Business-excluded and deferred records are not quarantined as invalid records; record their counts and reasons separately.
+
+Quarantine is not a substitute for extraction staging. After correction, rerun extraction and transformation against a new approved snapshot. Retain rejection evidence even when the failed processing transaction rolls back through the logging arrangement in Section 8.
+
+The runtime may write through authorized logging paths. Approved operators and administrators may read. Only authorized administrators may archive or delete. Enforce restricted database privileges and appropriate row-level policies before deployment.
+
+Archive older records within restricted PostgreSQL storage when needed. Verify counts, run IDs, reasons, and timestamps before treating an archive as complete. Archive copies remain subject to the original retention and access requirements.
+
+Before deletion, an administrator must confirm that the retention period has elapsed and the records are not needed for troubleshooting, audit, or recovery. Record the approval, run IDs, expected and actual counts, and outcome in a separate maintenance audit record. Pending entries must not be removed before successful delivery. Audit records follow their own applicable retention period.
