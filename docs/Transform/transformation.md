@@ -119,3 +119,23 @@ Duplicate detection must use identifiers, not repeated amounts or payment order 
 Unusually large finite values must be reviewed using measured profiles; no unverified threshold may silently remove them. Business exclusions such as deleted expenses belong to Section 5.
 
 Each rejected row must be counted once, with all applicable rule IDs retained. Modified rows remain part of retained input. Missing values must not be replaced with zero merely to make calculations succeed. Link actual profiling findings to these rules when Section 2 measurements are available.
+
+## 4. Standardization and Data Type Rules
+
+Standardization must preserve business meaning and operate on the cleaned working datasets.
+
+| Rule ID | Target | Standard and conversion | On failure |
+| --- | --- | --- | --- |
+| S-01 | Order and payment timestamps | Derive DATE using `(timestamp_value AT TIME ZONE 'Asia/Manila')::date`; retain original TIMESTAMPTZ for traceability | Reject missing or non-finite required dates |
+| S-02 | Expense date | Preserve DATE without timezone conversion; display as YYYY-MM-DD | Reject invalid required date |
+| S-03 | Order status | Lowercase trimmed text; validate against a versioned approved status mapping | Hold unknown codes for review; do not guess their meaning |
+| S-04 | Branch label | Preserve spelling and case after C-01 trimming | Reject unusable labels under C-02 |
+| S-05 | Weight and amounts | Use exact NUMERIC for intermediate calculations; round each final group total once to two decimals for NUMERIC(14,2) | Reject non-finite values or totals outside the target range |
+| S-06 | Identifiers and counts | Retain UUID identifiers; use BIGINT counts | Reject incompatible types or overflow |
+| S-07 | Run timestamps | Preserve TIMESTAMPTZ; display ISO 8601 with timezone offset | Reject unparseable required metadata |
+
+Currency is PHP and weight is kilograms. No currency or unit conversion is performed. Numeric source values are already typed; do not convert through floating-point arithmetic or formatted currency strings.
+
+The allowed status list must be established from the measured vocabulary and confirmed business meanings. Case and whitespace normalization does not authorize mapping an unfamiliar status to an existing code. Record the mapping version and changed-row counts.
+
+Rounding must occur after aggregation, not once per source row. Validate the rounded result before casting to NUMERIC(14,2). Conversion failures must be logged with the rule ID and affected record or group; they must not become silent NULLs or zeroes.
