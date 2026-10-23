@@ -215,3 +215,34 @@ Aggregate row count is not expected to equal input row count. Reconcile contribu
 Compare rounded group sums with the same per-group rounding method. The sum of rounded groups may differ from a rounded grand total; record the difference without hiding a failed group check.
 
 Any critical failure rejects the batch. Warnings hold the batch for review under Section 10. Record expected values, actual values, affected counts, and check outcomes.
+
+## 8. Transformation Metadata and Log Specification
+
+Store transformation metadata in restricted `etl_ops.transformation_logs`. Keep transformation and extraction run identities distinct and linked. Each table-level entry must identify its grain so aggregate output counts are not confused with contributing source counts.
+
+| Field | Purpose and format |
+| --- | --- |
+| run_id | Transformation UUID |
+| parent_run_id | Extraction pipeline_run_id; references Stage 1 metadata |
+| retry_of_run_id | Previous transformation attempt UUID, nullable |
+| batch_id | Logical batch identifier associated with cutoff and rules |
+| batch_window | Earliest processed business date and exclusive reporting cutoff; NULL lower date for empty input |
+| table_name | Input stream or transformed output name |
+| transformation_started_at, transformation_ended_at | TIMESTAMPTZ execution boundaries |
+| transformation_status | PASS, WARNING, or FAIL |
+| acceptance_status | APPROVED, MANUAL REVIEW, or REJECTED |
+| records_read, records_output | Received and produced row counts at the stated grain |
+| records_rejected | Distinct rejected rows |
+| records_excluded, records_deferred, records_contributing | Exclusive row-accounting totals |
+| records_modified | Distinct changed and retained rows |
+| rules_applied | JSONB rule IDs and affected counts; rule counts may overlap |
+| validation_results | JSONB check outcomes with expected and actual values |
+| error_code, error_message | Sanitized failure category and description |
+| duration_ms | Nonnegative runtime |
+| code_version, rule_version, schema_version | Implementation and contract versions used by the batch |
+
+Use metadata for monitoring, rule impact analysis, lineage, troubleshooting, and comparison of corrected reruns. Do not duplicate all extraction metadata or store credentials in diagnostics.
+
+Failure evidence must survive rollback. The orchestration layer must capture diagnostics before ending the processing transaction and persist them through a separate authorized logging transaction afterward. Permanent writes must not be attempted inside the existing read-only extraction transaction.
+
+Undelivered metadata must remain in a restricted pending store until delivery commits. Replay must preserve original run IDs and timestamps and avoid duplicate entries. If a connection fails before diagnostic evidence is durably captured, record incomplete logging and inspect available scheduler/service evidence; do not claim guaranteed recovery. A batch with incomplete required logs must not be reported as fully accepted.
