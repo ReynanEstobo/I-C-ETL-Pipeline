@@ -99,3 +99,23 @@ The following register defines the transformation profiling checks. Measurements
 | `stage_payments.order_id` | Distribution of payment rows per order | Two payments linked to one order | Pending measurement | Section 5: aggregate payments independently; repeated order references are not duplicate payment records. |
 
 Business exclusions, date-window deferrals, and multiple payments per order are distinct from data quality errors. Profiling must preserve all staged records. Each observed issue must reference its cleaning, standardization, or business rule in Sections 3, 4, or 5. A completed profile must contain measured findings and planned treatments for an identified batch.
+
+## 3. Data Cleaning Rules
+
+Cleaning must operate on temporary working copies and preserve raw staging. The profiling categories in Section 2 identify the targets below; measured findings remain pending. Rule counts must distinguish changed, rejected, and retained rows.
+
+| Rule ID | Target | Condition | Action | Justification |
+| --- | --- | --- | --- | --- |
+| C-01 | Branch labels and order statuses | Leading or trailing whitespace | Trim working values; count changed rows | Prevent formatting differences from affecting labels or status mapping |
+| C-02 | Required labels and statuses | NULL, blank after trimming, or embedded control characters | Reject and log; stop batch approval | No reliable replacement can be inferred |
+| C-03 | Weight and monetary fields | NULL or non-finite numeric value | Reject and log | These values cannot support valid reporting totals |
+| C-04 | Weight and monetary fields | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Negative weights are invalid; refund or adjustment handling must be established before interpreting negative amounts |
+| C-05 | IDs and order numbers | Duplicate identifier in working data | Reject the batch; retain neither row as an arbitrary winner | No extracted update timestamp establishes which version is authoritative |
+| C-06 | Required references and dates | Missing value or unmatched staged parent | Reject and log; do not substitute a default | Prevent incorrect branch, customer, order, or date attribution |
+| C-07 | Payment branch versus order branch | Different valid branch IDs | Hold for review without overwriting either value | Cross-branch collection handling requires an approved business rule |
+
+Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. No automatic duplicate removal is permitted without a documented selection rule.
+
+Unusually large finite values must be reviewed using measured profiles; no unverified threshold may silently remove them. Business exclusions such as deleted expenses belong to Section 5.
+
+Each rejected row must be counted once, with all applicable rule IDs retained. Modified rows remain part of retained input. Missing values must not be replaced with zero merely to make calculations succeed. Link actual profiling findings to these rules when Section 2 measurements are available.
