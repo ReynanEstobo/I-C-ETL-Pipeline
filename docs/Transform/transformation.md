@@ -139,3 +139,28 @@ Currency is PHP and weight is kilograms. No currency or unit conversion is perfo
 The allowed status list must be established from the measured vocabulary and confirmed business meanings. Case and whitespace normalization does not authorize mapping an unfamiliar status to an existing code. Record the mapping version and changed-row counts.
 
 Rounding must occur after aggregation, not once per source row. Validate the rounded result before casting to NUMERIC(14,2). Conversion failures must be logged with the rule ID and affected record or group; they must not become silent NULLs or zeroes.
+
+## 5. Business Transformation Rules
+
+Transform eligible working records into one daily branch summary. Reuse the captured reporting cutoff for the entire batch.
+
+| Rule ID | Input | Logic | Output / purpose |
+| --- | --- | --- | --- |
+| B-01 | Order and payment timestamps; expense dates | Use S-01/S-02 business dates; retain only dates earlier than the cutoff | Completed-day reporting; count deferred rows separately |
+| B-02 | Standardized order status | Exclude orders mapped to the approved cancelled code; record count and reason | Eligible order activity and value |
+| B-03 | Expense deletion timestamp | Exclude expenses with non-NULL deleted_at | Eligible expense totals |
+| B-04 | Eligible orders | Group by order business date and branch_id | order_count, released_order_count, unique_customer_count, total_weight_kg, order_value_php |
+| B-05 | Eligible payments | Group by collection business date and payment branch_id | payment_count and cash_received_php |
+| B-06 | Eligible expenses | Group by expense_date and branch_id | expense_total_php |
+| B-07 | Three aggregate datasets | Union distinct date/branch keys, then left join each aggregate on both keys | One row per date and branch; zero for an absent stream |
+| B-08 | Staged branch/customer/order references | Resolve UUID lookups with exactly one matching parent | Stable relationships without multiplying detail rows |
+
+For B-04, count eligible orders, count those mapped to released, count distinct customer_id, and sum weight_kg and total_price. Released orders are grouped by creation date; no release-event timestamp is available. A status change can therefore revise historical results.
+
+Payments remain independent ledger entries. A payment on a cancelled order must not be discarded solely because that order is excluded from order metrics. Negative amounts and cross-branch collections cannot proceed until the review requirements in Section 3 are resolved. Cancellation and release mappings must be approved before deployment; unknown statuses must never be treated implicitly as eligible.
+
+Never join raw orders, payments, and expenses together for aggregation. Each stream must first produce unique date/branch keys. A day with payments or expenses but no eligible orders must remain in the output. A date/branch with no eligible activity in any stream has no output row.
+
+No surrogate keys, dimension tables, or slowly changing dimensions are introduced. Branch IDs remain the grouping keys; labels come from staged branch references.
+
+Assign each input row one accounting category in this order: rejected, business-excluded, deferred, or contributing. Record additional matched reasons separately without double-counting exclusions. Preserve counts and source identifiers for traceability.
