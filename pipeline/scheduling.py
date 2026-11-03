@@ -491,6 +491,12 @@ def test_scheduled_extraction():
                     assert count == 0, f'{label}: staging was not cleared'
                     connection.execute(sql.SQL('DROP TABLE {}').format(
                         sql.Identifier('pg_temp', 'stage_' + table)))
+                # ON COMMIT DELETE ROWS clears contents, not table definitions.
+                # Each Cron run gets a fresh session; these cases reuse one.
+                for table in ('transformation_issues', 'transformation_accounting',
+                              'transformation_rules', 'transformed_daily_branch_summary'):
+                    connection.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(
+                        sql.Identifier('pg_temp', table)))
                 print(f'PASS: {label} ({rows[0][0]})')
 
             reset_fixtures()
