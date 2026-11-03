@@ -1,6 +1,6 @@
 """Stage 2 consumer: SQL transformations inside the approved extraction snapshot."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -47,6 +47,7 @@ class TransformationConsumer:
             raise ValueError('Repeatable-read snapshot required')
         started = datetime.now(timezone.utc)
         timer = perf_counter()
+        database_result_received = False
         self.result = {
             'run_id': str(uuid4()), 'parent_run_id': self.parent,
             'started_at': started.isoformat(), 'rule_version': VERSION,
@@ -63,6 +64,7 @@ class TransformationConsumer:
                     (Jsonb(database_payload),),
                 ).fetchone()[0]
                 self.result = response['transformation_run']
+                database_result_received = True
                 status = self.result['status']
                 if status == 'PASS':
                     self.result['handover'] = 'NOT_CONFIGURED'
@@ -82,8 +84,12 @@ class TransformationConsumer:
                                error_code='TRANSFORMATION_FAILED', handover='FAILED')
             raise
         finally:
-            self.result['ended_at'] = datetime.now(timezone.utc).isoformat()
-            self.result['duration_ms'] = int((perf_counter() - timer) * 1000)
+            # PostgreSQL owns timing for a returned transformation result.
+            # Mixing its start time with the client's clock can invert dates.
+            if not database_result_received:
+                elapsed = perf_counter() - timer
+                self.result['ended_at'] = (started + timedelta(seconds=elapsed)).isoformat()
+                self.result['duration_ms'] = int(elapsed * 1000)
             print(json.dumps(self.result, indent=2, default=str))
 
 
