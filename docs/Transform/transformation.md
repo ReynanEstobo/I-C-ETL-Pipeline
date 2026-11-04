@@ -20,7 +20,7 @@ Transformation receives the approved temporary staging tables defined in the [Ex
 | `pg_temp.stage_payments` | Prepare collection dates and amounts for daily branch payment measures. |
 | `pg_temp.stage_expenses` | Prepare expense dates, amounts, and deletion status for daily branch expense measures. |
 
-The handover must include the extraction `pipeline_run_id`, run-start timestamp, staged counts, validation results, and `APPROVED` acceptance status. Transformation must acknowledge the extraction run ID and acceptance decision before consuming the staged records. Batches marked `MANUAL REVIEW` or `REJECTED` must not proceed.
+The handover must include the extraction `pipeline_run_id`, run-start timestamp, staged counts, validation results, and either `APPROVED` or `APPROVED_WITH_WARNINGS` acceptance status. Transformation must acknowledge the extraction run ID and acceptance decision before consuming the staged records. `MANUAL REVIEW` and `REJECTED` batches must not proceed.
 
 The received batch contains all available history. Transformation must use the extraction run-start timestamp to establish one reporting cutoff: the start of that run's calendar date in **Asia/Manila**. Only business dates earlier than this cutoff contribute to completed-day reporting. Current-day and future-dated records must be counted separately from reporting contributions.
 
@@ -119,19 +119,19 @@ Business exclusions, date-window deferrals, and multiple payments per order are 
 
 ## 3. Data Cleaning Rules
 
-Cleaning must operate on temporary working copies and preserve raw staging. The measured profiling findings in Section 2 identify the targets below. Rule counts must distinguish changed, rejected, and retained rows.
+Cleaning must operate on temporary working copies and preserve raw staging. The measured profiling findings in Section 2 identify the targets below. Rule counts must distinguish changed, quarantined, and retained rows. A row-level issue in `orders`, `payments`, or `expenses` is evaluated by the tolerance policy in Section 10: the affected row may be quarantined while unrelated valid rows continue. Schema, source-access, dimension, reconciliation, and output-contract failures remain batch-stopping failures.
 
 | Rule ID | Target | Condition | Action | Justification |
 | --- | --- | --- | --- | --- |
 | C-01 | Branch labels and order statuses | Leading or trailing whitespace | Trim working values; count changed rows | Prevent formatting differences from affecting labels or status mapping |
-| C-02 | Required labels and statuses | NULL, blank after trimming, or embedded control characters | Reject and log; stop batch approval | No reliable replacement can be inferred |
-| C-03 | Weight and monetary fields | NULL or non-finite numeric value | Reject and log | These values cannot support valid reporting totals |
-| C-04 | Order weight | Negative value | Reject and log; stop batch approval | Negative weight cannot represent laundry demand |
-| C-05 | IDs and order numbers | Duplicate identifier in working data | Reject the batch; retain neither row as an arbitrary winner | No extracted update timestamp establishes which version is authoritative |
-| C-06 | Required references and dates | Missing value or unmatched staged parent | Reject and log; do not substitute a default | Prevent incorrect branch, customer, order, or date attribution |
-| C-07 | Payment branch versus order branch | Different valid branch IDs | Hold for review without overwriting either value | Cross-branch collection handling requires an approved business rule |
-| C-08 | Order value and expense amount | Negative value | Hold the batch for review; reject if no approved business rule supports the value | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
-| C-09 | Payment amount | Zero or negative value | Reject and log | The source schema requires payment amount greater than zero |
+| C-02 | Required labels and statuses | NULL, blank after trimming, or embedded control characters | Quarantine the affected fact row and log it; a bad branch or customer dimension stops the batch | No reliable replacement can be inferred |
+| C-03 | Weight and monetary fields | NULL or non-finite numeric value | Quarantine the affected fact row and log it | These values cannot support valid reporting totals |
+| C-04 | Order weight | Negative value | Quarantine the affected order and log it | Negative weight cannot represent laundry demand |
+| C-05 | IDs and order numbers | Duplicate identifier in working data | Quarantine every duplicate fact row; a duplicate branch or customer dimension stops the batch | No extracted update timestamp establishes which version is authoritative |
+| C-06 | Required references and dates | Missing value or unmatched staged parent | Quarantine the affected fact row; a failed branch or customer dimension stops the batch | Prevent incorrect branch, customer, order, or date attribution |
+| C-07 | Payment branch versus order branch | Different valid branch IDs | Quarantine the payment and log it for review | Cross-branch collection handling requires an approved business rule |
+| C-08 | Order value and expense amount | Negative value | Quarantine the affected row and log it for review | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
+| C-09 | Payment amount | Zero or negative value | Quarantine the payment and log it | The source schema requires payment amount greater than zero |
 
 Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. When a duplicate identifier is found, no duplicate record is kept and the batch is rejected because the source provides no update timestamp for selecting an authoritative version.
 
@@ -233,7 +233,7 @@ Aggregate row count is not expected to equal input row count. Reconcile contribu
 
 Compare rounded group sums with the same per-group rounding method. The sum of rounded groups may differ from a rounded grand total; record the difference without hiding a failed group check.
 
-Any critical failure rejects the batch. Warnings hold the batch for review under Section 10. Record expected values, actual values, affected counts, and check outcomes.
+Any schema, dimension, reconciliation, or output-contract failure rejects the batch. Row-level fact issues use the tolerance policy in Section 10. Record expected values, actual values, affected counts, and check outcomes.
 
 ## 8. Transformation Metadata and Log Specification
 
@@ -249,7 +249,7 @@ Store transformation metadata in restricted `etl_ops.transformation_logs`. Keep 
 | table_name | Input stream or transformed output name |
 | transformation_started_at, transformation_ended_at | TIMESTAMPTZ execution boundaries |
 | transformation_status | PASS, WARNING, or FAIL |
-| acceptance_status | APPROVED, MANUAL REVIEW, or REJECTED |
+| acceptance_status | APPROVED, APPROVED_WITH_QUARANTINE, MANUAL REVIEW, or REJECTED |
 | log_delivery_status | PENDING, SAVED, or FAILED; separate from the data acceptance decision |
 | records_read, records_output | Received and produced row counts at the stated grain |
 | records_rejected | Distinct rejected rows |
@@ -276,7 +276,7 @@ Transformation logs and rejection evidence must be retained for at least one yea
 | Record | Storage | Contents and ownership |
 | --- | --- | --- |
 | Transformation logs | etl_ops.transformation_logs | Counts, rule actions, validation outcomes, decisions, and lineage; owned by authorized ETL operations role |
-| Rejection evidence | etl_ops.transformation_quarantine | Batch/run IDs, staged table, record UUID, rule IDs, reason, and minimal offending values; owned by authorized ETL operations role |
+| Quarantine evidence | etl_ops.transformation_quarantine | Batch/run IDs, staged table, record UUID, rule IDs, severity, reason, and minimal offending values; owned by authorized ETL operations role |
 | Pending metadata | Restricted orchestration pending store | Undelivered diagnostic metadata; retained until durable delivery is confirmed |
 
 Quarantine must contain only the fields needed to diagnose a failed transformation. Do not copy complete customer records or unnecessary sensitive data. Business-excluded and deferred records are not quarantined as invalid records; record their counts and reasons separately.
@@ -291,17 +291,18 @@ Before deletion, an administrator must confirm that the retention period has ela
 
 ## 10. Transformation Acceptance and Handover Rules
 
-The rejection-rate threshold is **0%**, defined before processing. Daily financial summaries must not silently omit invalid contributing records. Business exclusions and date-window deferrals are not rejections.
+The row-level quarantine tolerance is **100%** for independently attributable fact rows in `orders`, `payments`, and `expenses`. A quarantined row never contributes to analytics. The output and metadata must explicitly record the quarantined count and rule evidence, so the system does not silently omit it. Business exclusions and date-window deferrals are not quarantines.
 
-Calculate the rejection rate from distinct rejected transaction rows divided by received transaction rows. For an empty denominator, record the rate as not applicable and apply the empty-output review rule. Reference failures independently block acceptance.
+Schema, extraction-contract, branch/customer dimension, aggregate reconciliation, and output-contract failures have **0% tolerance** because they can make unrelated analytics unreliable. Calculate the quarantine rate from distinct quarantined fact rows divided by received transaction rows. For an empty denominator, record the rate as not applicable and apply the empty-output review rule.
 
 | Validation condition | Acceptance | Pipeline action | Decision and responsibility |
 | --- | --- | --- | --- |
-| All critical checks pass; zero rejected rows; no unresolved warnings; required validation and handover metadata captured | APPROVED | Offer validated output to Load; finalize persistent logging after the transaction ends | Automatic |
-| No critical failure, but unresolved status, negative-amount, or branch policy, or an empty-output warning | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
-| Any critical failure, rejected row, incompatible contract, or missing required validation or handover metadata | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
+| All critical checks pass; zero quarantined rows; no unresolved warnings; required validation and handover metadata captured | APPROVED | Offer validated output to Load; finalize persistent logging after the transaction ends | Automatic |
+| Only independently attributable fact rows are quarantined and at least one valid output group remains | APPROVED_WITH_QUARANTINE | Offer the partial output; preserve quarantine evidence and counts | Automatic; operator reviews evidence separately |
+| No critical failure, but an empty-output warning remains | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
+| Any schema, dimension, reconciliation, output-contract, or operational failure; or no valid output remains after quarantining | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
 
-Manual review must resolve the issue or establish a versioned approved policy before a new batch is evaluated. Review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution.
+`APPROVED_WITH_QUARANTINE` does not repair source data. Operators must correct quarantined records and review later runs. Manual review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution.
 
 Retry transient operational failures with a new attempt and linked run IDs. Do not automatically retry unresolved business or validation failures.
 

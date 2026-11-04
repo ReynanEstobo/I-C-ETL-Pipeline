@@ -36,7 +36,7 @@ Do not filter, clean, standardize, or calculate business values during extractio
 
 - The account needs SELECT access to the required source columns and permission to create temporary tables.
 - Required source columns and types must match Section 2. Unexpected changes stop extraction.
-- Nullable dates and references are retained and reported. Warnings require review before handover.
+- Nullable dates and references are retained and reported. Warnings are handed to Stage 2 as `APPROVED_WITH_WARNINGS`, where the affected fact row is quarantined if it cannot safely contribute to analytics.
 - Full-history extraction includes late payments and historical corrections on subsequent runs, but its volume grows over time.
 - Temporary stages are available only in the current transaction and connection. They cannot be retained for review after the session closes.
 
@@ -89,7 +89,7 @@ Record per-check, per-table, and overall results. A table fails if any of its ch
 | `error_code` | Identifies the failure category. | `SOURCE_CONNECTION_FAILED`, `SCHEMA_MISMATCH`, or NULL |
 | `error_message` | Describes the failure without credentials. | TEXT or NULL |
 | `duration_ms` | Measures extraction runtime. | Non-negative integer |
-| `acceptance_status` | Records the handover decision separately from validation. | `APPROVED`, `MANUAL REVIEW`, `REJECTED` |
+| `acceptance_status` | Records the handover decision separately from validation. | `APPROVED`, `APPROVED_WITH_WARNINGS`, `MANUAL REVIEW`, `REJECTED` |
 
 Capture one run-start timestamp for the source snapshot and link table logs using the run ID. Retries receive new run IDs. Logs support monitoring, troubleshooting, auditing, and recovery; unavailable counts must not be reported as zero.
 
@@ -163,14 +163,14 @@ Check required columns and types before copying records. Stop if a required fiel
 | Condition | Acceptance criteria | Pipeline action | Decision and responsible role |
 | --- | --- | --- | --- |
 | All checks pass | All five datasets are complete, with no failed checks or warnings. | Mark `APPROVED`; allow the next stage to use staging in the same transaction. | Automatic. |
-| Non-critical warnings | Extraction is complete, but nullable dates or references need review. | Mark `MANUAL REVIEW`; stop handover, retain diagnostic logs, and discard temporary staging when the run ends. Rerun after review. | ETL operator or data owner reviews the source issue. |
+| Non-critical warnings | Extraction is complete, but nullable dates or references need review. | Mark `APPROVED_WITH_WARNINGS`; hand staging and warning evidence to the tolerant Stage 2 consumer. Stage 2 quarantines any affected unsafe fact row and records its decision. | Automatic handover; ETL operator or data owner reviews the evidence. |
 | Critical failure | Required source access, schema, identifiers, references, dates, counts, or completion checks fail. | Mark `REJECTED`; stop handover and roll back staging. Retain failure logs. Retry temporary failures with a new run ID. | Automatic stop; ETL operator or database administrator resolves the failure. |
 
-Manual review must resolve the warning or record an approved explanation before a new extraction is assessed for handover. Critical failures must be resolved before approval.
+Warnings do not repair source data. Operators must review and correct them even when Stage 2 safely quarantines their affected rows. Critical failures must be resolved before handover.
 
 ### Handover
 
-Handover must provide the five temporary stages, run ID, run timestamp, metadata, validation results, errors, and acceptance status. The next stage must acknowledge the run ID and decision within the same database transaction before consuming approved staged records. Held or rejected runs must retain diagnostic logs, discard staging, and require a new extraction after the issue is resolved. No file export or external staging store is used.
+Handover must provide the five temporary stages, run ID, run timestamp, metadata, validation results, errors, and acceptance status. The next stage must acknowledge the run ID and decision within the same database transaction before consuming `APPROVED` or `APPROVED_WITH_WARNINGS` staged records. Rejected runs retain diagnostic logs, discard staging, and require a new extraction after the issue is resolved. No file export or external staging store is used.
 
 A standalone extraction check through Python may display counts and validation results, then close the connection and remove temporary tables. This check is not a handover. Handover must occur while the temporary stages are still available. Cleaning, standardization, and business transformations are outside this stage.
 

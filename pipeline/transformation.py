@@ -33,13 +33,14 @@ class TransformationConsumer:
         self.parent = None
 
     def acknowledge(self, metadata):
-        if metadata.get('acceptance_status') != 'APPROVED':
-            raise ValueError('Approved extraction required')
+        if metadata.get('acceptance_status') not in ('APPROVED', 'APPROVED_WITH_WARNINGS'):
+            raise ValueError('Approved or warning-tolerant extraction required')
         self.parent = str(metadata['pipeline_run_id'])
         return metadata
 
     def consume(self, connection, payload):
-        if str(payload['pipeline_run_id']) != self.parent or payload['acceptance_status'] != 'APPROVED':
+        if (str(payload['pipeline_run_id']) != self.parent
+                or payload['acceptance_status'] not in ('APPROVED', 'APPROVED_WITH_WARNINGS')):
             raise ValueError('Handover identity mismatch')
         if connection.execute('SHOW transaction_read_only').fetchone()[0] != 'on':
             raise ValueError('Read-only snapshot required')
@@ -66,12 +67,13 @@ class TransformationConsumer:
                 self.result = response['transformation_run']
                 database_result_received = True
                 status = self.result['status']
-                if status == 'PASS':
+                if status in ('PASS', 'PARTIAL'):
                     self.result['handover'] = 'NOT_CONFIGURED'
                     if self.loader is not None:
                         offered = dict(self.result, output='pg_temp.transformed_daily_branch_summary')
                         ack = self.loader.acknowledge(offered)
-                        if not isinstance(ack, dict) or ack.get('run_id') != offered['run_id'] or ack.get('acceptance_status') != 'APPROVED':
+                        if (not isinstance(ack, dict) or ack.get('run_id') != offered['run_id']
+                                or ack.get('acceptance_status') != offered['acceptance_status']):
                             raise ValueError('Load acknowledgment mismatch')
                         self.loader.consume(connection, offered)
                         if connection.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
@@ -108,7 +110,7 @@ def flush_logs():
             connection.execute('INSERT INTO etl_ops.transformation_logs VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING',
                                (entry['run_id'], entry['parent_run_id'], entry['ended_at'], Jsonb(saved)))
             for index, issue in enumerate(entry.get('issues', [])):
-                if issue['severity'] == 'FAIL' and issue['record_id'] is not None:
+                if issue['severity'] in ('FAIL', 'WARNING') and issue['record_id'] is not None:
                     connection.execute('INSERT INTO etl_ops.transformation_quarantine VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING',
                                        (entry['run_id'], index, entry['ended_at'], Jsonb(issue)))
         path.unlink()
@@ -140,7 +142,7 @@ def main():
     if consumer.result is not None:
         save_logs(consumer.result)
         print('Transformation logs saved. No permanent reporting table was loaded.')
-        return code or {'PASS': 0, 'WARNING': 2, 'FAIL': 1}[consumer.result['status']]
+        return code or {'PASS': 0, 'PARTIAL': 0, 'WARNING': 2, 'FAIL': 1}[consumer.result['status']]
     return code or 1
 
 

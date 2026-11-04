@@ -141,6 +141,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
             overall text;
             table_status text;
             acceptance text;
+            handover_acceptance text;
             phase text;
             failure_code text;
             failure_message text;
@@ -234,11 +235,12 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                                 WHEN bool_or(c->>'status' = 'WARNING') THEN 'WARNING'
                                 ELSE 'PASS' END
                     INTO overall FROM jsonb_array_elements(checks) c;
-                    IF overall <> 'PASS' THEN
-                        -- Roll back staged records without treating warnings
-                        -- as execution failures or retrying data problems.
+                    IF overall = 'FAIL' THEN
+                        -- Failed extraction checks cannot be handed to Stage 2.
                         RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'Acceptance blocked';
                     END IF;
+                    handover_acceptance := CASE overall WHEN 'PASS' THEN 'APPROVED'
+                                                        ELSE 'APPROVED_WITH_WARNINGS' END;
                     phase := 'handover';
                     SELECT h.acknowledge_function, h.consume_function
                     INTO acknowledge_function, consume_function FROM {} h;
@@ -255,7 +257,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                         SELECT jsonb_object_agg(key, 'PASS')
                             INTO table_results FROM jsonb_each(expected);
                         handover_payload := jsonb_build_object(
-                            'pipeline_run_id', run_id, 'acceptance_status', 'APPROVED',
+                            'pipeline_run_id', run_id, 'acceptance_status', handover_acceptance,
                             'extraction_status', overall, 'extraction_started_at', started,
                             'extraction_ended_at', clock_timestamp(),
                             'duration_ms', floor(extract(epoch FROM clock_timestamp()-started)*1000)::bigint,
@@ -281,10 +283,10 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                             IF receiver = 1 THEN
                                 EXECUTE format('SELECT %I.%I($1)', receiver_schema, receiver_name)
                                     INTO acknowledgment USING jsonb_build_object(
-                                        'pipeline_run_id', run_id, 'acceptance_status', 'APPROVED');
+                                        'pipeline_run_id', run_id, 'acceptance_status', handover_acceptance);
                                 IF acknowledgment->>'pipeline_run_id' IS DISTINCT FROM run_id::text
-                                   OR acknowledgment->>'acceptance_status' IS DISTINCT FROM 'APPROVED' THEN
-                                    RAISE EXCEPTION 'Next stage did not acknowledge the approved run';
+                                   OR acknowledgment->>'acceptance_status' IS DISTINCT FROM handover_acceptance THEN
+                                    RAISE EXCEPTION 'Next stage did not acknowledge the extraction run';
                                 END IF;
                             ELSE
                                 EXECUTE format('SELECT %I.%I($1)', receiver_schema, receiver_name)
@@ -324,7 +326,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
                 END;
                 ended := clock_timestamp();
                 acceptance := CASE overall WHEN 'PASS' THEN 'APPROVED'
-                                          WHEN 'WARNING' THEN 'MANUAL REVIEW'
+                                          WHEN 'WARNING' THEN 'APPROVED_WITH_WARNINGS'
                                           ELSE 'REJECTED' END;
                 SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;
                 COMMIT;
@@ -503,7 +505,7 @@ def test_scheduled_extraction():
             run_case('Valid populated records', 'APPROVED')
             connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
                 sql.Identifier(test_schema, 'orders')))
-            run_case('Nullable branch warning', 'MANUAL REVIEW', expected_check='branch_id_present')
+            run_case('Nullable branch warning', 'APPROVED_WITH_WARNINGS', expected_check='branch_id_present')
             reset_fixtures()
             connection.execute(sql.SQL('UPDATE {} SET paid_at = NULL').format(
                 sql.Identifier(test_schema, 'payments')))
@@ -568,8 +570,9 @@ def test_scheduled_extraction():
             connection.execute('DELETE FROM pg_temp.handover_events')
             connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
                 sql.Identifier(test_schema, 'orders')))
-            run_case('Warning blocks receiver', 'MANUAL REVIEW', expected_check='branch_id_present')
-            assert connection.execute('SELECT count(*) FROM pg_temp.handover_events').fetchone()[0] == 0
+            run_case('Warning reaches tolerant receiver', 'APPROVED_WITH_WARNINGS', expected_check='branch_id_present')
+            assert connection.execute('SELECT event FROM pg_temp.handover_events ORDER BY ctid').fetchall() == [
+                ('acknowledge',), ('consume',)]
             reset_fixtures()
             connection.execute(sql.SQL('''CREATE OR REPLACE FUNCTION {}(metadata jsonb)
                 RETURNS jsonb LANGUAGE sql SECURITY INVOKER AS $bad$

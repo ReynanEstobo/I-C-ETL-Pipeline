@@ -32,14 +32,14 @@ def main():
     }
     cases = [
         ('Valid totals, multiple payments, and deleted expense', None, 'PASS', None),
-        ('Negative weight', 'UPDATE pg_temp.stage_orders SET weight_kg=-1', 'FAIL', 'C-04'),
-        ('Unknown status', "UPDATE pg_temp.stage_orders SET status='unknown'", 'WARNING', 'S-03'),
-        ('Zero payment', 'UPDATE pg_temp.stage_payments SET amount=0', 'FAIL', 'C-09'),
-        ('Negative payment', 'UPDATE pg_temp.stage_payments SET amount=-1', 'FAIL', 'C-09'),
-        ('Missing numeric', 'UPDATE pg_temp.stage_orders SET weight_kg=NULL', 'FAIL', 'C-03'),
-        ('Non-finite numeric', "UPDATE pg_temp.stage_orders SET weight_kg='NaN'::numeric", 'FAIL', 'C-03'),
-        ('Negative expense', 'UPDATE pg_temp.stage_expenses SET amount=-1', 'WARNING', 'C-08'),
-        ('Cross-branch payment', sql.SQL('UPDATE pg_temp.stage_payments SET branch_id={}').format(sql.Literal(other_branch)), 'WARNING', 'C-07'),
+        ('Negative weight', 'UPDATE pg_temp.stage_orders SET weight_kg=-1', 'PARTIAL', 'C-04'),
+        ('Unknown status', "UPDATE pg_temp.stage_orders SET status='unknown'", 'PARTIAL', 'S-03'),
+        ('Zero payment', 'UPDATE pg_temp.stage_payments SET amount=0', 'PARTIAL', 'C-09'),
+        ('Negative payment', 'UPDATE pg_temp.stage_payments SET amount=-1', 'PARTIAL', 'C-09'),
+        ('Missing numeric', 'UPDATE pg_temp.stage_orders SET weight_kg=NULL', 'PARTIAL', 'C-03'),
+        ('Non-finite numeric', "UPDATE pg_temp.stage_orders SET weight_kg='NaN'::numeric", 'PARTIAL', 'C-03'),
+        ('Negative expense', 'UPDATE pg_temp.stage_expenses SET amount=-1', 'PARTIAL', 'C-08'),
+        ('Cross-branch payment', sql.SQL('UPDATE pg_temp.stage_payments SET branch_id={}').format(sql.Literal(other_branch)), 'PARTIAL', 'C-07'),
         ('Cancelled order preserves payments', "UPDATE pg_temp.stage_orders SET status='cancelled'", 'PASS', None),
         ('Status whitespace and case', "UPDATE pg_temp.stage_orders SET status=' Released '", 'PASS', None),
         ('Current-day order deferred', "UPDATE pg_temp.stage_orders SET created_at='2026-10-23 02:00:00+00'", 'PASS', None),
@@ -72,19 +72,30 @@ def main():
                                               (Jsonb(payload),)).fetchone()[0]['transformation_run']
                 result = consume()
                 require(result['status'] == expected, f'{label}: expected {expected}, got {result}')
-                decision = {'PASS': 'APPROVED', 'WARNING': 'MANUAL REVIEW', 'FAIL': 'REJECTED'}[expected]
+                decision = {'PASS': 'APPROVED', 'PARTIAL': 'APPROVED_WITH_QUARANTINE',
+                            'WARNING': 'MANUAL REVIEW', 'FAIL': 'REJECTED'}[expected]
                 require(result['acceptance_status'] == decision, f'{label}: incorrect acceptance')
                 if rule:
                     require(any(issue['rule_id'] == rule for issue in result['issues']), f'{label}: missing {rule}')
                 rows = connection.execute('SELECT * FROM pg_temp.transformed_daily_branch_summary ORDER BY report_date, branch_id').fetchall()
-                if expected != 'PASS':
+                if expected in ('WARNING', 'FAIL'):
                     require(not rows, f'{label}: blocked batch retained output')
                 else:
                     excluded_order = label.startswith(('Cancelled', 'Current-day'))
+                    quarantined_order = expected == 'PARTIAL' and label in {
+                        'Negative weight', 'Unknown status', 'Missing numeric', 'Non-finite numeric'}
+                    quarantined_payment = expected == 'PARTIAL' and label in {
+                        'Zero payment', 'Negative payment', 'Cross-branch payment'}
+                    quarantined_expense = expected == 'PARTIAL' and label == 'Negative expense'
                     expected_row = (date(2026, 10, 12), branch,
-                                    0 if excluded_order else 1, 0 if excluded_order else 1,
-                                    0 if excluded_order else 1, Decimal(0 if excluded_order else 8),
-                                    Decimal(0 if excluded_order else 200), 2, Decimal(200), Decimal(50))
+                                    0 if excluded_order or quarantined_order else 1,
+                                    0 if excluded_order or quarantined_order else 1,
+                                    0 if excluded_order or quarantined_order else 1,
+                                    Decimal(0 if excluded_order or quarantined_order else 8),
+                                    Decimal(0 if excluded_order or quarantined_order else 200),
+                                    0 if quarantined_payment else 2,
+                                    Decimal(0 if quarantined_payment else 200),
+                                    Decimal(0 if quarantined_expense else 50))
                     require(rows == [expected_row], f'{label}: incorrect aggregate totals: {rows}')
                     consume()
                     rerun = connection.execute('SELECT * FROM pg_temp.transformed_daily_branch_summary ORDER BY report_date, branch_id').fetchall()

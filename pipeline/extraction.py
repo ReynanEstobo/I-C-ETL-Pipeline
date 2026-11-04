@@ -373,7 +373,7 @@ def acceptance_decision(results, failed=False):
     if failed:
         return 'REJECTED'
     return {
-        'PASS': 'APPROVED', 'WARNING': 'MANUAL REVIEW', 'FAIL': 'REJECTED',
+        'PASS': 'APPROVED', 'WARNING': 'APPROVED_WITH_WARNINGS', 'FAIL': 'REJECTED',
     }.get(results.get('status'), 'REJECTED')
 
 
@@ -387,7 +387,7 @@ def handover_extraction(connection, run_id, started, counts, results, consumer,
     No consumer is invoked for held or rejected runs.
     """
     decision = acceptance_decision(results)
-    if decision != 'APPROVED':
+    if decision not in ('APPROVED', 'APPROVED_WITH_WARNINGS'):
         raise AcceptanceBlocked(f'Handover blocked: {decision}.')
     if connection.closed or connection.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
         raise ExtractionError('Handover requires the active extraction transaction.')
@@ -570,7 +570,7 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
             print(f"Overall validation: {results['status']}")
             decision = acceptance_decision(results)
             print(f'Acceptance: {decision}')
-            if decision != 'APPROVED':
+            if decision not in ('APPROVED', 'APPROVED_WITH_WARNINGS'):
                 raise AcceptanceBlocked(f'Handover blocked: {decision}. Staging will be rolled back.')
             if consumer is not None:
                 handover_extraction(
@@ -578,7 +578,7 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
                     source_counts=source_counts, ended=datetime.now(timezone.utc),
                     duration=int((perf_counter() - timer) * 1000),
                 )
-                print('Approved extraction acknowledged by the next stage.')
+                print(f'Extraction ({decision}) acknowledged by the next stage.')
             else:
                 print('Standalone extraction check only; no next stage was invoked.')
             print('Records stayed in PostgreSQL; Python read only counts and check results.')
