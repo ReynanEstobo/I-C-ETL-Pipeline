@@ -18,12 +18,12 @@ Load receives `pg_temp.transformed_daily_branch_summary`, defined in the [Transf
 | --- | --- |
 | `pg_temp.transformed_daily_branch_summary` | Rows to publish: one row per `report_date` and `branch_id`. |
 | Transformation `run_id` | Acknowledged before receipt; stored as `transformation_run_id`. |
-| Parent extraction `pipeline_run_id` and `extraction_started_at`, passed through unchanged by Stage 2 | Lineage to Stage 1 and the snapshot-freshness check. |
+| Parent extraction run ID (`parent_run_id`, the Stage 1 `pipeline_run_id`) and `extraction_started_at`, passed through unchanged by Stage 2 | Lineage to Stage 1 and the snapshot-freshness check. |
 | `batch_id`, `batch_window`, and reporting cutoff | Identify the completed-day history being published. |
-| `records_output`, `quarantined_records`, validation results, and code, rule, and schema versions | Pre-load completeness checks and lineage. |
+| `records_output`, `quarantined_records`, `validation_results`, `code_version`, `rule_version`, and `schema_version` | Pre-load completeness checks and lineage. |
 | `acceptance_status` | Must be `APPROVED` or `APPROVED_WITH_QUARANTINE`. |
 
-The batch window is the Stage 2 `batch_window`: from the earliest processed business date up to, but excluding, the reporting cutoff. The cutoff is the Asia/Manila calendar date on which the extraction run started. A date inside the window with no eligible activity has no output row. For example, a run starting at 2026-11-12 01:00 Asia/Manila has cutoff 2026-11-12 and publishes dates up to 2026-11-11.
+The batch window is the Stage 2 `batch_window`: from the earliest processed business date up to, but excluding, the reporting cutoff. The cutoff is the Asia/Manila calendar date on which the extraction run started. A date inside the window with no eligible activity has no output row. Load reads the window as text such as `2026-10-12 to 2026-11-12`, a date range such as `[2026-10-12,2026-11-12)`, or a structured value with start and cutoff dates. For example, a run starting at 2026-11-12 01:00 Asia/Manila has cutoff 2026-11-12 and publishes dates up to 2026-11-11.
 
 Load must use only the handed-over rows. It must not read `public` source tables or `pg_temp.stage_*` tables to calculate or replace values, and it must not recalculate measures. The only reads outside the received batch are target-side checks: the published target, the publication records and removal approvals in `etl_ops`, and the branch foreign key.
 
@@ -179,8 +179,8 @@ Checks at receipt run inside the snapshot transaction, before Load accepts the b
 | Check name | Target | Purpose | Validation criteria | Severity |
 | --- | --- | --- | --- | --- |
 | Handover status | Stage 2 handover metadata | Load approved data only | The acknowledgment returns the offered `run_id` and `acceptance_status`, which is `APPROVED` or `APPROVED_WITH_QUARANTINE`. `MANUAL REVIEW` and `REJECTED` batches are never received. | Critical |
-| Handover completeness | Stage 2 handover metadata | Keep every batch traceable | The transformation run ID, parent extraction run ID, `extraction_started_at`, `batch_id`, batch window, cutoff, `records_output`, validation results, and versions are present. `quarantined_records` is present for `APPROVED_WITH_QUARANTINE` and treated as 0 for `APPROVED`. | Critical |
-| Input contract | `pg_temp.transformed_daily_branch_summary` | Prevent type and column errors | The ten contract columns exist with the Section 2 types, and the Stage 2 `schema_version` is supported. | Critical |
+| Handover completeness | Stage 2 handover metadata | Keep every batch traceable | The transformation run ID, parent extraction run ID, `extraction_started_at`, `batch_id`, batch window, cutoff, `records_output`, validation results, and versions are present. `quarantined_records` is present for `APPROVED_WITH_QUARANTINE` and treated as 0 for `APPROVED`. The batch window cutoff equals the Asia/Manila date of `extraction_started_at`. | Critical |
+| Input contract | `pg_temp.transformed_daily_branch_summary` | Prevent type and column errors | The ten contract columns exist with the Section 2 types, and the Stage 2 `schema_version` is supported (currently `1.0.0`). | Critical |
 | Input record count | `pg_temp.load_daily_branch_summary` | Detect lost or extra rows during receipt | Rows copied = rows in the transformed output = handover `records_output`. | Critical |
 
 ### Before writing (publication transaction)
@@ -193,7 +193,7 @@ Checks at receipt run inside the snapshot transaction, before Load accepts the b
 | Overlap lock | Load advisory lock | Prevent two simultaneous publications | `pg_try_advisory_xact_lock` succeeds on the dedicated load key, which is separate from the extraction and log-recovery keys. | Critical; retried as transient |
 | Duplicate batch | `etl_ops.load_publications.transformation_run_id` | Avoid publishing twice | No committed publication exists for this transformation run ID. | Critical |
 | Snapshot freshness | Latest row in `etl_ops.load_publications` | Prevent an older batch from replacing newer data | The incoming `extraction_started_at` is later than the latest published `extraction_started_at`, or no publication exists yet. | Critical; not retried |
-| Storage capacity | Supabase database | Avoid running out of space mid-load | `pg_database_size(current_database())` plus the estimated batch size is below 95% of the configured plan limit. Between 80% and 95% is reported as a warning. | Critical above 95%; warning (reported only) at 80–95% |
+| Storage capacity | Supabase database | Avoid running out of space mid-load | `pg_database_size(current_database())` plus the estimated batch size is below 95% of the plan limit set in `DATABASE_SIZE_LIMIT_MB`. Between 80% and 95%, or when the limit is not set, is reported as a warning. | Critical above 95%; warning (reported only) at 80–95% or when the limit is not set |
 | Published history removal | Target keys versus received keys | Detect history disappearing from reports | Every currently published key is in the batch, or it is approved for removal in `etl_ops.load_review_approvals`. | Warning; holds publication |
 
 ## 5. Post-Load Validation and Reconciliation
@@ -253,9 +253,33 @@ Store one row per load attempt in restricted `etl_ops.load_logs`.
 | `load_status` | Validation outcome | `PASS`, `WARNING`, `FAIL` |
 | `acceptance_status` | Publication decision | `APPROVED`, `MANUAL REVIEW`, `REJECTED` |
 | `log_delivery_status` | Log persistence, separate from the data decision | `PENDING`, `SAVED`, `FAILED` |
-| `error_code` | Failure category | `LOAD_LOCK_BUSY`, `SCHEMA_MISMATCH`, `STALE_BATCH`, `DUPLICATE_BATCH`, `RECONCILIATION_FAILED`, or NULL |
+| `error_code` | Failure category | One of the error codes below, or NULL |
 | `error_message` | Sanitized description without credentials | TEXT or NULL |
 | `load_code_version`, `schema_version` | Load implementation and target contract versions | `1.0.0` |
+
+### Error codes
+
+| Error code | Meaning |
+| --- | --- |
+| `HANDOVER_NOT_APPROVED` | The Stage 2 acceptance status is not `APPROVED` or `APPROVED_WITH_QUARANTINE`. |
+| `HANDOVER_INCOMPLETE` | Required handover metadata is missing, or the batch window cutoff does not match `extraction_started_at`. |
+| `HANDOVER_MISMATCH` | The received rows do not belong to the acknowledged transformation run. |
+| `SCHEMA_MISMATCH` | The Stage 2 output or the target does not match the contract. |
+| `INPUT_COUNT_MISMATCH` | Rows copied, rows in the transformed output, and `records_output` differ. |
+| `READ_ONLY_TRANSACTION` | The publication transaction is not read-write. |
+| `PERMISSION_DENIED` | The pipeline role lacks a required privilege. |
+| `LOAD_LOCK_BUSY` | Another load holds the publication lock. Retried. |
+| `DUPLICATE_BATCH` | The transformation run is already published. |
+| `STALE_BATCH` | A newer snapshot is already published. |
+| `STORAGE_LIMIT` | Storage would exceed 95% of the plan limit. |
+| `HISTORY_REMOVAL_HELD` | Published keys are absent from the batch and not approved for removal (`MANUAL REVIEW`). |
+| `RECONCILIATION_FAILED` | One or more post-load checks failed. |
+| `STATEMENT_TIMEOUT` | A statement exceeded the 60-second limit. |
+| `FOREIGN_KEY_VIOLATION`, `CONSTRAINT_VIOLATION`, `DUPLICATE_KEY` | A database constraint rejected the write. |
+| `TRANSIENT_DATABASE_ERROR` | Serialization failure, deadlock, or lock timeout. Retried. |
+| `COMMIT_UNVERIFIED` | `COMMIT` returned, but no publication record was found. |
+| `COMMIT_OUTCOME_UNKNOWN` | The connection failed during `COMMIT`; check `etl_ops.load_publications` before any rerun. |
+| `LOAD_FAILED` | Any other database error. |
 
 ### Use of load metadata
 
@@ -306,7 +330,7 @@ Archive and delete load records using the [Extraction archive and deletion proce
 | --- | --- | --- | --- |
 | All pre-load and post-load critical checks pass, with no holding warning | Batch published exactly and reconciled | `APPROVED`: commit, record the log, report completion | Automatic |
 | As above, but the input is `APPROVED_WITH_QUARANTINE` | Load checks pass; Stage 2 quarantine is recorded | `APPROVED`: publish, and show `quarantined_input_records` in the log and the completion report | Automatic; the ETL operator reviews the Stage 2 quarantine evidence |
-| Only a storage warning (80–95%) | Load checks pass | `APPROVED`: publish and notify the database administrator | Automatic |
+| Only a storage warning (80–95%, or the limit is not set) | Load checks pass | `APPROVED`: publish and notify the database administrator | Automatic |
 | Published history removal without approval | Previously published keys are absent from the batch | `MANUAL REVIEW`: roll back, keep the previous publication, record the held keys | ETL operator and data owner review |
 | Any critical check fails, or a SQL error, timeout, or interruption occurs | Batch not acceptable | `REJECTED`: roll back, retry transient errors as in Section 3, otherwise stop | Automatic stop; the ETL operator or database administrator resolves the cause |
 
