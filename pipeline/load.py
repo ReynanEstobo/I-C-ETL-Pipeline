@@ -20,17 +20,24 @@ Load core (Load.md Sections 1, 3, 4, 5, and 8):
   post-load checks, then COMMIT or ROLLBACK, with limited retries.
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
 from time import perf_counter, sleep
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
+from pipeline import extraction, transformation
 from pipeline.connection import SourceConnectionError, connect_source
 
 LOAD_CODE_VERSION = '1.0.0'
@@ -681,8 +688,13 @@ class LoadConsumer:
         self.load_run_id = None
         self.receipt_started_at = None
         self.receipt_checks = []
+        self.handover_meta = None
         self.batch = None
         self.failure = None
+        self.results = None
+        self.publish_error = None
+        self.log_entries = []
+        self.log_error = None
 
     @staticmethod
     def prepare(connection):
@@ -708,6 +720,11 @@ class LoadConsumer:
         self.receipt_checks = checks = []
         self.batch = None
         self.failure = None
+        self.results = None
+        # Kept for the load log even when the handover is rejected.
+        self.handover_meta = {key: offered.get(key) for key in (
+            'run_id', 'parent_run_id', 'extraction_started_at', 'batch_id',
+            'batch_window', 'acceptance_status')}
 
         status = offered.get('acceptance_status')
         if record_check(checks, 'handover_status', status in ACCEPTED_INPUT_STATUSES,
@@ -794,6 +811,40 @@ class LoadConsumer:
                 self._reject('INPUT_COUNT_MISMATCH', f'Received row counts differ: {counts}.')
             batch.records_received = copied
             batch.measure_totals = measure_totals(cursor, RECEIVED_TABLE)
+
+    def _queue_unverified(self, result):
+        """Before COMMIT, queue the load log with an unverified outcome (Load.md Section 6)."""
+        try:
+            queue_load_log(build_load_log(self, result, provisional=True))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise LoadRejected('LOG_QUEUE_FAILED',
+                               'Load metadata could not be queued before COMMIT.') from None
+
+    def after_commit(self, connection):
+        """After the snapshot commits: publish, persist load metadata, then clear
+        the receipt table (Load.md Section 1, steps 3-4).
+
+        Never raises, so a load problem is not reported as an extraction failure.
+        """
+        if self.batch is None or self.failure is not None or self.batch.records_received is None:
+            return
+        try:
+            self.results = publish(connection, self, before_commit=self._queue_unverified)
+        except Exception:  # noqa: BLE001 - recorded in the load log instead
+            self.results = []
+            self.publish_error = ('Publication stopped unexpectedly; check '
+                                  'etl_ops.load_publications before rerunning.')
+        self.log_entries = [build_load_log(self, result) for result in self.results] or [
+            build_load_log(self, error_code='LOAD_FAILED', error_message=self.publish_error)]
+        try:
+            save_load_logs(self.log_entries)
+        except LOG_DELIVERY_ERRORS:
+            self.log_error = ('Load metadata was not fully delivered; it stays queued. '
+                              'Run python -m pipeline.load --flush-logs.')
+        try:
+            discard_received_batch(connection)
+        except psycopg.Error:
+            pass
 
 
 def discard_received_batch(connection):
@@ -1096,8 +1147,13 @@ def _database_error_code(sqlstate):
     }.get(sqlstate, 'TRANSIENT_DATABASE_ERROR' if sqlstate in RETRYABLE_SQLSTATES else 'LOAD_FAILED')
 
 
-def publish_attempt(connection, batch, load_run_id, retry_of_run_id=None) -> LoadResult:
-    """One publication transaction (Load.md Section 1, step 3)."""
+def publish_attempt(connection, batch, load_run_id, retry_of_run_id=None,
+                    before_commit=None) -> LoadResult:
+    """One publication transaction (Load.md Section 1, step 3).
+
+    before_commit(result), when given, runs after every check passes and just
+    before COMMIT; raising LoadRejected from it rolls the publication back.
+    """
     result = LoadResult(load_run_id=load_run_id, retry_of_run_id=retry_of_run_id,
                         load_started_at=datetime.now(timezone.utc))
     timer = perf_counter()
@@ -1113,6 +1169,8 @@ def publish_attempt(connection, batch, load_run_id, retry_of_run_id=None) -> Loa
                 run_preload_checks(cursor, batch, result)
                 write_target(cursor, batch, result)
                 run_postload_checks(cursor, batch, result)
+                if before_commit is not None:
+                    before_commit(result)
             committing = True
         result.commit_verified = confirm_publication(connection, load_run_id)
         if result.commit_verified:
@@ -1171,7 +1229,7 @@ def publish_attempt(connection, batch, load_run_id, retry_of_run_id=None) -> Loa
     return result
 
 
-def publish(connection, consumer) -> list:
+def publish(connection, consumer, before_commit=None) -> list:
     """Publish a received batch with limited retries (Load.md Sections 3 and 8).
 
     Runs on the run's connection after the snapshot transaction has committed.
@@ -1184,7 +1242,8 @@ def publish(connection, consumer) -> list:
     results = []
     load_run_id, retry_of_run_id = consumer.load_run_id, None
     for attempt in range(1, MAX_PUBLICATION_ATTEMPTS + 1):
-        result = publish_attempt(connection, consumer.batch, load_run_id, retry_of_run_id)
+        result = publish_attempt(connection, consumer.batch, load_run_id, retry_of_run_id,
+                                 before_commit)
         results.append(result)
         if not result.retryable or attempt == MAX_PUBLICATION_ATTEMPTS:
             break
@@ -1193,10 +1252,480 @@ def publish(connection, consumer) -> list:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Load metadata and pending queue (Load.md Sections 6 and 7)
+# ---------------------------------------------------------------------------
+
+USAGE = 'Usage: python -m pipeline.load [--flush-logs | setup [--dry-run] | test]'
+PENDING_SUFFIX = '.load'
+# An unverified entry this recent may belong to a publication still running.
+UNVERIFIED_GRACE_SECONDS = 600
+LOG_COLUMNS = (
+    'load_run_id', 'transformation_run_id', 'extraction_run_id', 'retry_of_run_id',
+    'batch_id', 'batch_window', 'published_date_range', 'reporting_cutoff',
+    'extraction_started_at', 'table_name', 'load_type', 'load_started_at', 'load_ended_at',
+    'duration_ms', 'input_acceptance_status', 'quarantined_input_records', 'records_received',
+    'records_inserted', 'records_updated', 'records_unchanged', 'records_deleted',
+    'records_rejected', 'measure_totals', 'revisions', 'pre_load_results', 'post_load_results',
+    'load_status', 'acceptance_status', 'log_delivery_status', 'error_code', 'error_message',
+    'load_code_version', 'schema_version',
+)
+JSON_LOG_COLUMNS = frozenset({'measure_totals', 'revisions', 'pre_load_results', 'post_load_results'})
+LOG_DELIVERY_ERRORS = (psycopg.Error, SourceConnectionError, OSError, ValueError, KeyError,
+                       subprocess.SubprocessError)
+
+
+def _uuid_text(value):
+    try:
+        return str(UUID(str(value))) if value not in (None, '') else None
+    except ValueError:
+        return None
+
+
+def _timestamp_text(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _text(value):
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+def build_load_log(consumer, result=None, *, error_code=None, error_message=None,
+                   provisional=False) -> dict:
+    """One etl_ops.load_logs entry (Load.md Section 6) with its rejections.
+
+    Without a result, the batch was never published: a rejected receipt or a
+    snapshot that did not commit. A provisional entry is queued just before
+    COMMIT and is finalized once the commit result is known.
+    """
+    batch = consumer.batch
+    meta = consumer.handover_meta or {}
+    now = datetime.now(timezone.utc)
+    started = result.load_started_at if result else (consumer.receipt_started_at or now)
+    ended = result.load_ended_at if result and result.load_ended_at else now
+    received = batch.records_received if batch else None
+    if provisional:
+        counts = (result.records_inserted, result.records_updated, result.records_unchanged,
+                  result.records_deleted, 0)
+        acceptance = 'APPROVED'
+        status = overall_load_status(result.pre_load_results + result.post_load_results, acceptance)
+    elif result is not None:
+        counts = (result.records_inserted, result.records_updated, result.records_unchanged,
+                  result.records_deleted, result.records_rejected)
+        acceptance, status = result.acceptance_status, result.load_status
+        error_code, error_message = result.error_code, result.error_message
+    else:
+        # Nothing was written; unavailable counts stay NULL rather than zero.
+        counts = (0, 0, 0, 0, received) if received is not None else (None,) * 5
+        acceptance, status = 'REJECTED', 'FAIL'
+    duration = (result.duration_ms if result and result.duration_ms is not None
+                else max(0, int((ended - started).total_seconds() * 1000)))
+    entry = {
+        'load_run_id': result.load_run_id if result else consumer.load_run_id,
+        'transformation_run_id': _uuid_text(batch.transformation_run_id if batch else meta.get('run_id')),
+        'extraction_run_id': _uuid_text(batch.extraction_run_id if batch else meta.get('parent_run_id')),
+        'retry_of_run_id': result.retry_of_run_id if result else None,
+        'batch_id': _text(batch.batch_id if batch else meta.get('batch_id')),
+        'batch_window': _text(batch.batch_window if batch else meta.get('batch_window')),
+        'published_date_range': result.published_date_range if result else None,
+        'reporting_cutoff': batch.reporting_cutoff if batch else None,
+        'extraction_started_at': _timestamp_text(
+            batch.extraction_started_at if batch else meta.get('extraction_started_at')),
+        'table_name': TARGET_TABLE,
+        'load_type': 'FULL',
+        'load_started_at': started,
+        'load_ended_at': ended,
+        'duration_ms': duration,
+        'input_acceptance_status': (batch.input_acceptance_status if batch
+                                    else _text(meta.get('acceptance_status'))),
+        'quarantined_input_records': batch.quarantined_input_records if batch else None,
+        'records_received': received,
+        'records_inserted': counts[0],
+        'records_updated': counts[1],
+        'records_unchanged': counts[2],
+        'records_deleted': counts[3],
+        'records_rejected': counts[4],
+        'measure_totals': batch.measure_totals if batch and batch.measure_totals else None,
+        'revisions': result.revisions if result else [],
+        'pre_load_results': list(consumer.receipt_checks) + (result.pre_load_results if result else []),
+        'post_load_results': result.post_load_results if result else [],
+        'load_status': status,
+        'acceptance_status': acceptance,
+        'log_delivery_status': 'PENDING',
+        'error_code': error_code,
+        'error_message': error_message,
+        'load_code_version': LOAD_CODE_VERSION,
+        'schema_version': TARGET_SCHEMA_VERSION,
+        'rejections': result.rejections if result else [],
+        'outcome_verified': not provisional and not (
+            result is not None and result.error_code == 'COMMIT_OUTCOME_UNKNOWN'
+            and result.commit_verified is None),
+    }
+    # Dates, timestamps, UUIDs, and exact decimals become text for the queue.
+    return json.loads(json.dumps(entry, default=str))
+
+
+def queue_load_log(entry):
+    """Durably write one entry to the private pending directory."""
+    directory = extraction.private_pending_directory()
+    target = directory / (entry['load_run_id'] + PENDING_SUFFIX)
+    descriptor, temporary = tempfile.mkstemp(dir=directory, suffix='.tmp')
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            json.dump(entry, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def resolve_unverified(cursor, entry):
+    """Finalize an entry whose commit result was never recorded (Load.md Section 9)."""
+    cursor.execute('SELECT 1 FROM etl_ops.load_publications WHERE load_run_id = %s',
+                   (entry['load_run_id'],))
+    if cursor.fetchone():
+        entry.update(acceptance_status='APPROVED', error_code=None, error_message=None,
+                     records_rejected=0)
+        entry['load_status'] = overall_load_status(
+            entry['pre_load_results'] + entry['post_load_results'], 'APPROVED')
+    else:
+        entry.update(
+            acceptance_status='REJECTED', load_status='FAIL', error_code='COMMIT_OUTCOME_UNKNOWN',
+            error_message='The run ended before its commit result was recorded; '
+                          'no publication record exists.',
+            records_inserted=0, records_updated=0, records_unchanged=0, records_deleted=0,
+            records_rejected=entry.get('records_received'), revisions=[])
+    entry['outcome_verified'] = True
+
+
+def deliver_load_log(cursor, entry):
+    """Insert one entry and its rejections; a replay never duplicates rows."""
+    values = []
+    for column in LOG_COLUMNS:
+        value = 'SAVED' if column == 'log_delivery_status' else entry.get(column)
+        values.append(Jsonb(value) if column in JSON_LOG_COLUMNS and value is not None else value)
+    cursor.execute(sql.SQL(
+        'INSERT INTO etl_ops.load_logs ({}) VALUES ({}) ON CONFLICT (load_run_id) DO NOTHING'
+    ).format(_columns(LOG_COLUMNS), sql.SQL(', ').join([sql.Placeholder()] * len(LOG_COLUMNS))),
+        values)
+    for number, item in enumerate(entry.get('rejections') or []):
+        offending = item.get('offending_values')
+        cursor.execute('''
+            INSERT INTO etl_ops.load_rejections (
+                load_run_id, item_number, report_date, branch_id, check_name, reason,
+                offending_values, recorded_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (load_run_id, item_number) DO NOTHING
+        ''', (entry['load_run_id'], number, item.get('report_date'),
+              _uuid_text(item.get('branch_id')), item['check_name'], item['reason'],
+              Jsonb(offending) if offending is not None else None, entry['load_ended_at']))
+
+
+def flush_load_logs() -> int:
+    """Deliver queued load metadata; remove an entry only after its commit."""
+    if not extraction.PENDING_LOG_DIRECTORY.exists():
+        return 0
+    directory = extraction.private_pending_directory()
+    saved = 0
+    for path in sorted(directory.glob('*' + PENDING_SUFFIX)):
+        entry = json.loads(path.read_text(encoding='utf-8'))
+        if not entry.get('outcome_verified', True):
+            started = datetime.fromisoformat(entry['load_started_at'])
+            if (datetime.now(timezone.utc) - started).total_seconds() < UNVERIFIED_GRACE_SECONDS:
+                continue
+        with connect_source() as connection:
+            connection.read_only = False
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    if not entry.get('outcome_verified', True):
+                        resolve_unverified(cursor, entry)
+                    deliver_load_log(cursor, entry)
+        path.unlink(missing_ok=True)
+        saved += 1
+    return saved
+
+
+def save_load_logs(entries) -> int:
+    """Queue every entry first, then deliver the queue."""
+    for entry in entries:
+        queue_load_log(entry)
+    return flush_load_logs()
+
+
+# ---------------------------------------------------------------------------
+# Manual runs: extraction, transformation, and load on one connection
+# ---------------------------------------------------------------------------
+
+def run_pipeline(flush_only=False) -> int:
+    """`python -m pipeline.load` (Load.md Section 1, manual runs)."""
+    try:
+        recovered = flush_load_logs()
+    except LOG_DELIVERY_ERRORS:
+        print('Pending load logs could not be delivered. Entries were kept; the run did not start.')
+        return 1
+    if recovered:
+        print(f'Recovered {recovered} pending load log entries.')
+    if flush_only:
+        print('Pending load-log delivery completed.')
+        return 0
+    try:
+        transformation.flush_logs()
+    except LOG_DELIVERY_ERRORS:
+        print('Pending transformation logs could not be delivered. '
+              'Entries were kept; the run did not start.')
+        return 1
+
+    loader = LoadConsumer()
+    stage2 = transformation.TransformationConsumer(loader=loader)
+    code = extraction.main(stage2)
+    if stage2.result is not None:
+        try:
+            transformation.save_logs(stage2.result)
+        except LOG_DELIVERY_ERRORS:
+            print('Transformation logs are queued but not delivered yet.')
+
+    if loader.load_run_id is not None and loader.results is None:
+        # Received but never published: a rejected receipt, or the snapshot did not commit.
+        if loader.failure is not None:
+            entry = build_load_log(loader, error_code=loader.failure.code,
+                                   error_message=str(loader.failure))
+        else:
+            entry = build_load_log(
+                loader, error_code='SNAPSHOT_NOT_COMMITTED',
+                error_message='The extraction snapshot did not commit; the received batch was discarded.')
+        loader.log_entries = [entry]
+        try:
+            save_load_logs(loader.log_entries)
+        except LOG_DELIVERY_ERRORS:
+            loader.log_error = ('Load metadata was not fully delivered; it stays queued. '
+                                'Run python -m pipeline.load --flush-logs.')
+    return report_load(loader, stage2, code)
+
+
+def report_load(loader, stage2, code) -> int:
+    """Print the completion report (Load.md Section 8) and return the exit code."""
+    if not loader.log_entries:
+        print('Load did not run: no approved transformation output was offered.')
+        if code:
+            return code
+        return 2 if (stage2.result or {}).get('status') == 'WARNING' else 1
+    final = loader.log_entries[-1]
+    print(f"Load decision: {final['acceptance_status']} (load_status {final['load_status']})")
+    if final['error_code']:
+        print(f"Reason: {final['error_code']}: {final['error_message']}")
+    if len(loader.log_entries) > 1:
+        print(f'Publication attempts: {len(loader.log_entries)}')
+    print(f"Load run {final['load_run_id']}; transformation run {final['transformation_run_id']}; "
+          f"extraction run {final['extraction_run_id']}")
+    print(f"Batch window {final['batch_window']}; cutoff {final['reporting_cutoff']}; "
+          f"published dates {final['published_date_range']}")
+    print('Records: received {records_received}, inserted {records_inserted}, updated '
+          '{records_updated}, unchanged {records_unchanged}, removed {records_deleted}, '
+          'rejected {records_rejected}; quarantined input {quarantined_input_records}'.format(**final))
+    if final['acceptance_status'] == 'APPROVED' and loader.results:
+        print(f'Published to {TARGET_TABLE}; refreshed_at {loader.results[-1].refreshed_at}.')
+    elif final['acceptance_status'] == 'MANUAL REVIEW':
+        print('Publication held for review; the previous publication is unchanged. '
+              'Held keys are in etl_ops.load_rejections.')
+    else:
+        print('Nothing was published; the previous publication is unchanged.')
+    print(f"Duration {final['duration_ms']} ms. "
+          + (loader.log_error or 'Load details saved in etl_ops.load_logs.'))
+    return {'APPROVED': 0, 'MANUAL REVIEW': 2}.get(final['acceptance_status'], 1)
+
+
+# ---------------------------------------------------------------------------
+# Tests: `python -m pipeline.load test`, inside one rolled-back transaction
+# ---------------------------------------------------------------------------
+
+class _RolledBackConnection:
+    """Nested transactions become savepoints of one outer transaction, and
+    session mode changes are ignored, so publication never commits."""
+
+    def __init__(self, connection):
+        object.__setattr__(self, '_connection', connection)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __setattr__(self, name, value):
+        if name not in ('read_only', 'isolation_level'):
+            setattr(self._connection, name, value)
+
+
+def _require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def _load_scenarios(connection) -> int:
+    cursor = connection.cursor()
+    problems = verify_load_objects(cursor)
+    _require(not problems, 'run python -m pipeline.load setup first: ' + '; '.join(problems))
+    cursor.execute('SELECT id FROM public.branches ORDER BY id LIMIT 1')
+    row = cursor.fetchone()
+    _require(row is not None, 'public.branches has no branch to test with')
+    branch = row[0]
+    # Start from an empty target inside this transaction; real rows return on rollback.
+    cursor.execute(f'DELETE FROM {TARGET_TABLE}')
+    cursor.execute("SELECT coalesce(max(extraction_started_at), now()) + interval '1 day' "
+                   'FROM etl_ops.load_publications')
+    base = cursor.fetchone()[0]
+    cursor.execute("SELECT (%s::timestamptz AT TIME ZONE 'Asia/Manila')::date", (base,))
+    first_cutoff = cursor.fetchone()[0]
+    day1, day2 = first_cutoff - timedelta(days=3), first_cutoff - timedelta(days=2)
+    window_start = day1 - timedelta(days=1)
+    definitions = sql.SQL(', ').join(
+        sql.SQL('{} {}').format(sql.Identifier(column), sql.SQL(kind))
+        for column, kind in CONTRACT_COLUMNS.items())
+    connection.execute(sql.SQL('CREATE TEMP TABLE transformed_daily_branch_summary ({})')
+                       .format(definitions))
+    LoadConsumer.prepare(connection)
+    target = _RolledBackConnection(connection)
+
+    row_a = (day1, branch, 2, 1, 2, Decimal('16.00'), Decimal('400.00'), 2,
+             Decimal('300.00'), Decimal('50.00'))
+    row_a2 = row_a[:6] + (Decimal('450.00'),) + row_a[7:]
+    row_b = (day2, branch, 1, 0, 1, Decimal('8.00'), Decimal('200.00'), 1,
+             Decimal('200.00'), Decimal('0.00'))
+    unknown_branch = (day2, uuid4()) + row_b[2:]
+    state = {'minute': 0, 'passed': 0}
+
+    def target_rows():
+        cursor.execute(f'SELECT count(*) FROM {TARGET_TABLE}')
+        return cursor.fetchone()[0]
+
+    def case(label, rows, expected, code=None, *, minute=None, cutoff_shift=0, **handover):
+        state['minute'] += 1
+        started = base + timedelta(minutes=state['minute'] if minute is None else minute)
+        cursor.execute(f'DELETE FROM {TRANSFORMED_TABLE}')
+        cursor.executemany(sql.SQL('INSERT INTO {} VALUES ({})').format(
+            sql.SQL(TRANSFORMED_TABLE), sql.SQL(', ').join([sql.Placeholder()] * 10)), rows)
+        cursor.execute("SELECT (%s::timestamptz AT TIME ZONE 'Asia/Manila')::date", (started,))
+        cutoff = cursor.fetchone()[0]
+        offered = {
+            'run_id': str(uuid4()), 'parent_run_id': str(uuid4()), 'acceptance_status': 'APPROVED',
+            'extraction_started_at': started, 'batch_id': 'load-test',
+            'batch_window': f'{window_start} to {cutoff + timedelta(days=cutoff_shift)}',
+            'records_output': len(rows), 'validation_results': {'status': 'PASS'},
+            'code_version': '1.0.0', 'rule_version': '1.0.0', 'schema_version': '1.0.0',
+        }
+        offered.update(handover)
+        consumer, results = LoadConsumer(), []
+        try:
+            consumer.acknowledge(offered)
+            consumer.consume(connection, offered)
+        except LoadRejected as rejected:
+            outcome, got = 'REJECTED', rejected.code
+        else:
+            results = publish(target, consumer)
+            outcome, got = results[-1].acceptance_status, results[-1].error_code
+        _require((outcome, got) == (expected, code),
+                 f'{label}: expected {expected} {code or ""}, got {outcome} {got or ""}')
+        state['passed'] += 1
+        print(f'PASS: {label} -> {outcome}' + (f' ({got})' if got else ''), flush=True)
+        return consumer, offered, results
+
+    first_consumer, _, results = case('First publication', [row_a, row_b], 'APPROVED')
+    first = results[-1]
+    _require((first.records_inserted, first.records_rejected) == (2, 0) and target_rows() == 2,
+             'First publication: expected 2 inserted rows')
+    _, _, results = case('Rerun without changes', [row_a, row_b], 'APPROVED')
+    _require((results[-1].records_inserted, results[-1].records_unchanged) == (0, 2)
+             and target_rows() == 2, 'Rerun: expected 2 unchanged rows and no duplicates')
+    _, changed_offer, results = case('Changed measure', [row_a2, row_b], 'APPROVED')
+    changed = results[-1]
+    _require((changed.records_updated, changed.records_unchanged, len(changed.revisions)) == (1, 1, 1),
+             'Changed measure: expected 1 updated row with its revision')
+    case('Duplicate transformation run', [row_a2, row_b], 'REJECTED', 'DUPLICATE_BATCH',
+         run_id=changed_offer['run_id'])
+    case('Older snapshot', [row_a2, row_b], 'REJECTED', 'STALE_BATCH', minute=0)
+    _, _, results = case('Published key missing, not approved', [row_a2], 'MANUAL REVIEW',
+                         'HISTORY_REMOVAL_HELD')
+    _require(target_rows() == 2 and results[-1].rejections,
+             'History removal: expected the held key recorded and the target unchanged')
+    cursor.execute('INSERT INTO etl_ops.load_review_approvals (report_date, branch_id, reason) '
+                   'VALUES (%s, %s, %s)', (day2, branch, 'Load test approval'))
+    _, _, results = case('Published key missing, approved', [row_a2], 'APPROVED')
+    cursor.execute('SELECT count(*) FROM etl_ops.load_review_approvals WHERE applied_load_run_id = %s',
+                   (results[-1].load_run_id,))
+    _require(results[-1].records_deleted == 1 and target_rows() == 1 and cursor.fetchone()[0] >= 1,
+             'Approved removal: expected 1 removed row and the approval marked as applied')
+    case('Unknown branch', [row_a2, unknown_branch], 'REJECTED', 'FOREIGN_KEY_VIOLATION')
+    _require(target_rows() == 1, 'Unknown branch: expected the target unchanged')
+    case('Handover not approved', [row_a2], 'REJECTED', 'HANDOVER_NOT_APPROVED',
+         acceptance_status='MANUAL REVIEW')
+    case('Incomplete handover', [row_a2], 'REJECTED', 'HANDOVER_INCOMPLETE', batch_id=None)
+    case('Row count differs from handover', [row_a2], 'REJECTED', 'INPUT_COUNT_MISMATCH',
+         records_output=5)
+    case('Batch window cutoff mismatch', [row_a2], 'REJECTED', 'HANDOVER_INCOMPLETE', cutoff_shift=1)
+    with connect_source() as holder:
+        with holder.transaction():
+            holder.execute('SELECT pg_advisory_xact_lock(%s, %s)', LOAD_LOCK_KEY)
+            _, _, attempts = case('Publication lock busy', [row_a2], 'REJECTED', 'LOAD_LOCK_BUSY')
+    _require(len(attempts) == MAX_PUBLICATION_ATTEMPTS
+             and attempts[1].retry_of_run_id == attempts[0].load_run_id,
+             'Lock busy: expected 3 attempts linked by retry_of_run_id')
+
+    deliver_load_log(cursor, build_load_log(first_consumer, first))
+    cursor.execute('SELECT acceptance_status, log_delivery_status FROM etl_ops.load_logs '
+                   'WHERE load_run_id = %s', (first.load_run_id,))
+    _require(cursor.fetchone() == ('APPROVED', 'SAVED'),
+             'Log delivery: expected the entry in etl_ops.load_logs')
+    state['passed'] += 1
+    print('PASS: Load log delivery -> SAVED', flush=True)
+    return state['passed']
+
+
+def run_load_tests() -> int:
+    """Run every load scenario in one transaction that is rolled back at the end."""
+    passed = 0
+    try:
+        with connect_source() as connection:
+            connection.read_only = False
+            with connection.transaction():
+                passed = _load_scenarios(connection)
+                raise psycopg.Rollback()
+    except (AssertionError, LoadSetupError) as error:
+        print(f'Load test failed: {error}')
+        return 1
+    except SourceConnectionError as error:
+        print(error)
+        return 1
+    except psycopg.Error as error:
+        print(f'Load test failed (SQLSTATE: {error.sqlstate or "unavailable"}): '
+              f'{error.diag.message_primary}')
+        return 1
+    print(f'All {passed} load tests passed. Everything was rolled back: '
+          'nothing was published or logged.')
+    return 0
+
+
 def main(argv=None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ['setup']:
+        return run_setup(args)
+    if args == ['test']:
+        return run_load_tests()
+    if args not in ([], ['--flush-logs']):
+        print(USAGE)
+        return 1
+    return run_pipeline(flush_only=args == ['--flush-logs'])
+
+
+def run_setup(args) -> int:
     if args not in (['setup'], ['setup', '--dry-run']):
-        print('Usage: python -m pipeline.load setup [--dry-run]')
+        print(USAGE)
         return 1
     dry_run = '--dry-run' in args
     try:

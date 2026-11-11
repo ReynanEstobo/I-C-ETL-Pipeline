@@ -124,11 +124,14 @@ def check_source_access(connection: psycopg.Connection) -> None:
 
 
 @contextmanager
-def extract_source(source_counts=None, staged_counts=None, run_checks=None, prepare=None):
+def extract_source(source_counts=None, staged_counts=None, run_checks=None, prepare=None,
+                   after_commit=None):
     """Stage source rows in SQL and yield the connection and row counts.
 
     Stages remain available inside this context only. Future SQL validation
     must use the yielded connection before leaving this transaction.
+    after_commit(connection), when given, runs after the snapshot commits and
+    before the connection closes, so a later stage can publish on it.
     """
     run_checks = run_checks if run_checks is not None else []
     phase = 'source_accessibility'
@@ -217,6 +220,10 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None, prep
                             retryable=is_temporary_database_error(error),
                         ) from None
                 yield connection, counts
+            # The snapshot has committed. A later stage may publish on this
+            # connection before it closes (Load.md Section 1, step 3).
+            if after_commit is not None:
+                after_commit(connection)
     except AcceptanceBlocked:
         raise
     except (SourceConnectionError, ExtractionError):
@@ -556,7 +563,8 @@ def run_extraction_attempt(consumer=None, retry_state=None) -> int:
     print(f'Run ID: {run_id}')
     try:
         with extract_source(source_counts, staged_counts, run_checks,
-                            prepare=getattr(consumer, 'prepare', None)) as (connection, counts):
+                            prepare=getattr(consumer, 'prepare', None),
+                            after_commit=getattr(consumer, 'after_commit', None)) as (connection, counts):
             print('Extraction completed from one read-only snapshot.')
             for table, count in counts.items():
                 print(f'stage_{table}: {count} rows')

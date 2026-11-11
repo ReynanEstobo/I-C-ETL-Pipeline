@@ -25,7 +25,18 @@ def prepare(connection):
 class TransformationConsumer:
     """No source rows leave PostgreSQL; only diagnostics and counts are returned."""
 
-    prepare = staticmethod(prepare)
+    def prepare(self, connection):
+        """Create Stage 2 and, when configured, Load temporary tables before the snapshot."""
+        prepare(connection)
+        if self.loader is not None and hasattr(self.loader, 'prepare'):
+            self.loader.prepare(connection)
+
+    def after_commit(self, connection):
+        """Let Load publish after the snapshot commits, on the same connection."""
+        if self.loader is not None and self.result and self.result.get('handover') == 'ACKNOWLEDGED':
+            publish = getattr(self.loader, 'after_commit', None)
+            if publish is not None:
+                publish(connection)
 
     def __init__(self, loader=None):
         self.loader = loader
@@ -71,6 +82,9 @@ class TransformationConsumer:
                     self.result['handover'] = 'NOT_CONFIGURED'
                     if self.loader is not None:
                         offered = dict(self.result, output='pg_temp.transformed_daily_branch_summary')
+                        # Pass the extraction identity through unchanged for Load.
+                        offered.setdefault('parent_run_id', self.parent)
+                        offered.setdefault('extraction_started_at', payload['extraction_started_at'])
                         ack = self.loader.acknowledge(offered)
                         if (not isinstance(ack, dict) or ack.get('run_id') != offered['run_id']
                                 or ack.get('acceptance_status') != offered['acceptance_status']):

@@ -39,7 +39,11 @@ Load must use only the handed-over rows. It must not read `public` source tables
 
 ### Load method
 
-- **Tools:** SQL inside PostgreSQL writes the target. Python will wrap the load for manual runs and testing using `psycopg` (`python -m pipeline.load`). Records must stay in PostgreSQL rather than being downloaded into Python memory.
+- **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs and testing using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
+  - `python -m pipeline.load` runs extraction, transformation, and load on one connection.
+  - `python -m pipeline.load setup` creates the load objects; `setup --dry-run` validates them and rolls back.
+  - `python -m pipeline.load test` runs the load scenarios inside one transaction that is rolled back, so nothing is published or logged.
+  - `python -m pipeline.load --flush-logs` delivers queued load metadata.
 - **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The scheduled path runs inside `etl_ops.run_scheduled_extraction()`, invoked by the Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction`.
 - **Write method:** Set-based bulk SQL from the received temporary table: one `INSERT ... ON CONFLICT (report_date, branch_id) DO UPDATE` statement, plus a `DELETE` limited to approved absent keys (Section 3). Rows are not inserted one at a time, and `TRUNCATE` is not used.
 
@@ -279,6 +283,8 @@ Store one row per load attempt in restricted `etl_ops.load_logs`.
 | `TRANSIENT_DATABASE_ERROR` | Serialization failure, deadlock, or lock timeout. Retried. |
 | `COMMIT_UNVERIFIED` | `COMMIT` returned, but no publication record was found. |
 | `COMMIT_OUTCOME_UNKNOWN` | The connection failed during `COMMIT`; check `etl_ops.load_publications` before any rerun. |
+| `LOG_QUEUE_FAILED` | Load metadata could not be queued before `COMMIT`, so the publication rolled back. |
+| `SNAPSHOT_NOT_COMMITTED` | The batch was received, but the extraction snapshot did not commit; nothing was published. |
 | `LOAD_FAILED` | Any other database error. |
 
 ### Use of load metadata
@@ -291,7 +297,7 @@ Store one row per load attempt in restricted `etl_ops.load_logs`.
 
 ### Log delivery
 
-Failure evidence must survive rollback. Capture diagnostics before the publication transaction ends, and persist them in a separate logging transaction afterwards. Before `COMMIT`, the wrapper queues the entry with an unverified outcome, then finalizes it once the commit result is known.
+Failure evidence must survive rollback. Capture diagnostics before the publication transaction ends, and persist them in a separate logging transaction afterwards. Before `COMMIT`, the wrapper queues the entry with an unverified outcome, then finalizes it once the commit result is known. If a run stops before finalizing, a later flush resolves the entry from `etl_ops.load_publications`. An unverified entry less than ten minutes old is left for a later flush, because its publication may still be running.
 
 Manual runs keep undelivered entries in the private `.pending-extraction-logs` directory with a `.load` suffix, separate from the `.transformation` entries of Stage 2. Replay them with `python -m pipeline.load --flush-logs`. Scheduled runs commit entries to `etl_ops.pending_load_logs` before delivering them to `etl_ops.load_logs`. Replay preserves the original IDs and timestamps, avoids duplicates using `load_run_id`, and removes a pending entry only after delivery commits.
 
