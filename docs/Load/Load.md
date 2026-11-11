@@ -41,10 +41,9 @@ Load must use only the handed-over rows. It must not read `public` source tables
 
 - **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs and testing using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
   - `python -m pipeline.load` runs extraction, transformation, and load on one connection.
-  - `python -m pipeline.load setup` creates the load objects; `setup --dry-run` validates them and rolls back.
   - `python -m pipeline.load test` runs the load scenarios inside one transaction that is rolled back, so nothing is published or logged.
   - `python -m pipeline.load --flush-logs` delivers queued load metadata.
-- **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The scheduled path runs inside `etl_ops.run_scheduled_extraction()`, invoked by the Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction`.
+- **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction` runs `CALL etl_ops.run_scheduled_pipeline();`, which runs `etl_ops.run_scheduled_extraction()` and then publishes in the same session.
 - **Write method:** Set-based bulk SQL from the received temporary table: one `INSERT ... ON CONFLICT (report_date, branch_id) DO UPDATE` statement, plus a `DELETE` limited to approved absent keys (Section 3). Rows are not inserted one at a time, and `TRUNCATE` is not used.
 
 ### Transaction design
@@ -60,13 +59,13 @@ The extraction snapshot transaction is read-only `REPEATABLE READ`. PostgreSQL a
 
 The snapshot transaction stays read-only, so source tables cannot change during extraction. The load-owned copy keeps the received batch available after extraction staging is cleared at commit. The publication transaction reads only that copy, the target, and the `etl_ops` load tables. Because the session default remains read-only, the publication transaction must explicitly switch to read-write: `SET TRANSACTION READ WRITE` in the scheduled procedure, or a read-write transaction on the `psycopg` connection.
 
-Scheduled receipt uses a receiver configured by the database administrator in `etl_ops.transformation_handover`, which has the same structure as `etl_ops.extraction_handover`. Its acknowledgment and receipt functions use invoker permissions inside the snapshot transaction. After the snapshot commits, the procedure runs `etl_ops.publish_daily_branch_summary()` in the publication transaction. Manual runs pass a Load receiver to the Stage 2 consumer and run publication on the same connection before it closes. With no receiver configured, Stage 2 records the handover as `NOT_CONFIGURED`, and nothing is published.
+In scheduled runs, `etl_ops.consume_transformation_with_load(jsonb)` is the consume function in `etl_ops.extraction_handover`. It runs the Stage 2 consumer, then calls the Load receiver configured by the database administrator in `etl_ops.transformation_handover`, which has the same structure as `etl_ops.extraction_handover`. The receiver functions, `etl_ops.load_acknowledge(jsonb)` and `etl_ops.load_receive(jsonb)`, use invoker permissions inside the snapshot transaction. After the extraction procedure returns, `etl_ops.run_scheduled_pipeline()` runs `etl_ops.publish_daily_branch_summary(load_run_id, retry_of_run_id)` in the publication transaction. Manual runs pass a Load receiver to the Stage 2 consumer and run publication on the same connection before it closes. With no receiver configured, Stage 2 records the handover as `NOT_CONFIGURED`, and nothing is published.
 
 ### Load scope
 
 - **Tables and order:** One target table, `analytics.daily_branch_summary`. No dimension tables are loaded: `public.branches` is the existing branch reference, maintained by the application. The order is receipt, pre-load checks, target write and publication record, post-load checks, `COMMIT`, then logging.
 - **Expected volume:** One row per completed business date and branch with eligible activity: at most 3 × the number of completed dates, or about 1,095 rows for each year of history. The profiled Stage 2 batch covered two business dates, so at most 6 rows.
-- **Time window:** The publication transaction uses `SET LOCAL lock_timeout = '5s'` and `SET LOCAL statement_timeout = '60s'`. The whole run, including retries, must finish before 02:00 Asia/Manila, well before branches open.
+- **Time window:** The publication transaction uses `SET LOCAL lock_timeout = '5s'`. Manual runs also use `SET LOCAL statement_timeout = '60s'`; scheduled runs do not, because the whole Cron procedure runs as one statement. The whole run, including retries, must finish before 02:00 Asia/Manila, well before branches open.
 
 ### Limitations and assumptions
 
@@ -83,7 +82,7 @@ Scheduled receipt uses a receiver configured by the database administrator in `e
   - **Never granted:** TRUNCATE, DDL, or INSERT, UPDATE, and DELETE on `public` tables.
 - Scheduled and production runs must use `ic_etl_runtime`, never the project's `postgres` account, which is limited to local development and testing. Before the first scheduled run, and after any row-level security change, compare the source row counts seen by `ic_etl_runtime` with those seen by `postgres`. Extraction compares source and staging counts using the same role, so a role that cannot see some rows would pass that check while missing history.
 - Passwords and connection strings stay in the local `.env` file or Supabase secrets, never in documentation or logs.
-- A database administrator creates the target, indexes, and load metadata tables once through a versioned setup step. The daily load never runs DDL.
+- A database administrator creates the target, indexes, and load metadata tables once by running the load setup SQL in the Supabase SQL Editor. The scheduled-load SQL then adds the scheduled functions, configures `etl_ops.transformation_handover`, and sets the storage limit in `etl_ops.load_settings`. The daily load never runs DDL; it only checks that those objects match Section 2.
 - Writes take `ROW EXCLUSIVE` locks, which do not block readers. Dashboards continue to read the previous publication until the publication transaction commits.
 
 ## 2. Target Tables and Column Specification
@@ -197,7 +196,7 @@ Checks at receipt run inside the snapshot transaction, before Load accepts the b
 | Overlap lock | Load advisory lock | Prevent two simultaneous publications | `pg_try_advisory_xact_lock` succeeds on the dedicated load key, which is separate from the extraction and log-recovery keys. | Critical; retried as transient |
 | Duplicate batch | `etl_ops.load_publications.transformation_run_id` | Avoid publishing twice | No committed publication exists for this transformation run ID. | Critical |
 | Snapshot freshness | Latest row in `etl_ops.load_publications` | Prevent an older batch from replacing newer data | The incoming `extraction_started_at` is later than the latest published `extraction_started_at`, or no publication exists yet. | Critical; not retried |
-| Storage capacity | Supabase database | Avoid running out of space mid-load | `pg_database_size(current_database())` plus the estimated batch size is below 95% of the plan limit set in `DATABASE_SIZE_LIMIT_MB`. Between 80% and 95%, or when the limit is not set, is reported as a warning. | Critical above 95%; warning (reported only) at 80–95% or when the limit is not set |
+| Storage capacity | Supabase database | Avoid running out of space mid-load | `pg_database_size(current_database())` plus the estimated batch size is below 95% of the plan limit, set in `DATABASE_SIZE_LIMIT_MB` for manual runs and in `etl_ops.load_settings.database_size_limit_mb` for scheduled runs. Between 80% and 95%, or when the limit is not set, is reported as a warning. | Critical above 95%; warning (reported only) at 80–95% or when the limit is not set |
 | Published history removal | Target keys versus received keys | Detect history disappearing from reports | Every currently published key is in the batch, or it is approved for removal in `etl_ops.load_review_approvals`. | Warning; holds publication |
 
 ## 5. Post-Load Validation and Reconciliation
@@ -299,7 +298,7 @@ Store one row per load attempt in restricted `etl_ops.load_logs`.
 
 Failure evidence must survive rollback. Capture diagnostics before the publication transaction ends, and persist them in a separate logging transaction afterwards. Before `COMMIT`, the wrapper queues the entry with an unverified outcome, then finalizes it once the commit result is known. If a run stops before finalizing, a later flush resolves the entry from `etl_ops.load_publications`. An unverified entry less than ten minutes old is left for a later flush, because its publication may still be running.
 
-Manual runs keep undelivered entries in the private `.pending-extraction-logs` directory with a `.load` suffix, separate from the `.transformation` entries of Stage 2. Replay them with `python -m pipeline.load --flush-logs`. Scheduled runs commit entries to `etl_ops.pending_load_logs` before delivering them to `etl_ops.load_logs`. Replay preserves the original IDs and timestamps, avoids duplicates using `load_run_id`, and removes a pending entry only after delivery commits.
+Manual runs keep undelivered entries in the private `.pending-extraction-logs` directory with a `.load` suffix, separate from the `.transformation` entries of Stage 2. Replay them with `python -m pipeline.load --flush-logs`. Scheduled runs write each entry to `etl_ops.pending_load_logs` in the same transaction as the publication, then `etl_ops.recover_load_logs()` delivers it to `etl_ops.load_logs`; undelivered entries are replayed at the start of the next scheduled run. Replay preserves the original IDs and timestamps, avoids duplicates using `load_run_id`, and removes a pending entry only after delivery commits.
 
 The publication record in `etl_ops.load_publications` commits with the target, so the duplicate-batch check, the freshness check, and commit verification never wait for log delivery. Log delivery failure is separate from publication. Record it as `PENDING` or `FAILED`, and never republish a batch because its log failed.
 

@@ -15,7 +15,8 @@ from pipeline.extraction import (
 
 
 JOB_NAME = 'ic_laundry_daily_extraction'
-JOB_COMMAND = 'CALL etl_ops.run_scheduled_extraction();'
+# The job runs extraction and Stage 2, then publishes the load in the same session.
+JOB_COMMAND = 'CALL etl_ops.run_scheduled_pipeline();'
 
 
 def log_recovery_sql(schema='etl_ops'):
@@ -675,7 +676,7 @@ def manage_schedule(action):
             connection.autocommit = True
             with connection.cursor() as cursor:
                 cursor.execute(JOB_COMMAND)
-            print('Database extraction check completed. Inspect extraction logs.')
+            print('Scheduled pipeline run completed. Inspect the extraction, transformation, and load logs.')
             return
         if action == 'update':
             with connection.cursor() as cursor:
