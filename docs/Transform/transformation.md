@@ -306,7 +306,7 @@ Schema, extraction-contract, branch/customer dimension, aggregate reconciliation
 
 Retry transient operational failures with a new attempt and linked run IDs. Do not automatically retry unresolved business or validation failures.
 
-Handover must include the temporary output reference, transformation run ID, parent extraction run ID, batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
+Handover must include the temporary output reference, transformation run ID, parent extraction run ID and its run-start timestamp (`extraction_started_at`, passed through unchanged), batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
 
 Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone must not be recorded as successful publication. Load owns permanent writes and publication acceptance; integration must resolve the transaction dependency identified in Section 1.
 

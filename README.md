@@ -6,3 +6,4 @@ I&C Laundry is a centralized management system for the Main, Calzada, and Nasugb
 
 - [ETL Stage 1: Data Extraction](docs/extraction/extraction.md)
 - [ETL Stage 2: Data Transformation](docs/Transform/transformation.md)
+- [ETL Stage 3: Data Load](docs/Load/Load.md)
