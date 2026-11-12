@@ -85,6 +85,17 @@ class TransformationConsumer:
                         # Pass the extraction identity through unchanged for Load.
                         offered.setdefault('parent_run_id', self.parent)
                         offered.setdefault('extraction_started_at', payload['extraction_started_at'])
+                        # Stage 2 sends only `cutoff`. Build the batch window Load
+                        # requires, the same way the scheduled handover does: the
+                        # earliest output date and the Manila date extraction started.
+                        if offered.get('batch_window') in (None, ''):
+                            start, cutoff = connection.execute(
+                                "SELECT min(report_date), "
+                                "(%s::timestamptz AT TIME ZONE 'Asia/Manila')::date "
+                                'FROM pg_temp.transformed_daily_branch_summary',
+                                (offered['extraction_started_at'],),
+                            ).fetchone()
+                            offered['batch_window'] = {'start': start, 'cutoff': cutoff}
                         ack = self.loader.acknowledge(offered)
                         if (not isinstance(ack, dict) or ack.get('run_id') != offered['run_id']
                                 or ack.get('acceptance_status') != offered['acceptance_status']):

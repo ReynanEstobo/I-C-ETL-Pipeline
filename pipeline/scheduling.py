@@ -19,6 +19,95 @@ JOB_NAME = 'ic_laundry_daily_extraction'
 JOB_COMMAND = 'CALL etl_ops.run_scheduled_pipeline();'
 
 
+def load_handover_consumer_sql():
+    """Install the Stage 2-to-Load handover contract repair."""
+    return '''
+        CREATE OR REPLACE FUNCTION etl_ops.consume_transformation_with_load(payload jsonb)
+        RETURNS jsonb
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            v_response JSONB;
+            v_run JSONB;
+            v_offered JSONB;
+            v_answer JSONB;
+            v_handover TEXT := 'NOT_CONFIGURED';
+            v_acknowledge REGPROCEDURE;
+            v_consume REGPROCEDURE;
+            v_schema TEXT;
+            v_name TEXT;
+        BEGIN
+            v_response := etl_ops.consume_transformation(payload);
+            v_run := v_response->'transformation_run';
+            IF v_run IS NULL OR coalesce(v_run->>'status', '') NOT IN ('PASS', 'PARTIAL') THEN
+                RETURN v_response;
+            END IF;
+
+            SELECT h.acknowledge_function, h.consume_function INTO v_acknowledge, v_consume
+            FROM etl_ops.transformation_handover h;
+            IF v_acknowledge IS NOT NULL THEN
+                -- Pass the extraction identity through unchanged for Load.
+                v_offered := v_run || jsonb_build_object(
+                    'output', 'pg_temp.transformed_daily_branch_summary');
+                IF NOT v_offered ? 'parent_run_id' THEN
+                    v_offered := v_offered || jsonb_build_object(
+                        'parent_run_id', payload->'pipeline_run_id');
+                END IF;
+                IF NOT v_offered ? 'extraction_started_at' THEN
+                    v_offered := v_offered || jsonb_build_object(
+                        'extraction_started_at', payload->'extraction_started_at');
+                END IF;
+                -- Load requires a Stage 2 window with an exclusive Manila-date cutoff.
+                -- Do not replace a window emitted by a newer transformation function.
+                IF NOT v_offered ? 'batch_window'
+                   OR v_offered->'batch_window' IS NULL
+                   OR v_offered->>'batch_window' = '' THEN
+                    v_offered := v_offered || jsonb_build_object(
+                        'batch_window', jsonb_build_object(
+                            'start', (SELECT min(report_date)
+                                      FROM pg_temp.transformed_daily_branch_summary),
+                            'cutoff', ((payload->>'extraction_started_at')::timestamptz
+                                       AT TIME ZONE 'Asia/Manila')::date));
+                END IF;
+                BEGIN
+                    v_handover := 'FAILED';
+                    FOR receiver IN 1..2 LOOP
+                        v_name := NULL;
+                        SELECT ns.nspname, p.proname INTO v_schema, v_name
+                        FROM pg_catalog.pg_proc p
+                        JOIN pg_catalog.pg_namespace ns ON ns.oid = p.pronamespace
+                        WHERE p.oid = CASE receiver WHEN 1 THEN v_acknowledge::oid
+                                                    ELSE v_consume::oid END
+                          AND p.prokind = 'f' AND p.pronargs = 1
+                          AND p.proargtypes[0] = 'jsonb'::regtype
+                          AND p.prorettype = 'jsonb'::regtype
+                          AND NOT p.prosecdef;
+                        IF v_name IS NULL THEN
+                            RAISE EXCEPTION 'Load receivers must be invoker functions accepting and returning JSONB';
+                        END IF;
+                        EXECUTE format('SELECT %I.%I($1)', v_schema, v_name)
+                            INTO v_answer USING v_offered;
+                        IF v_answer ? 'rejected' THEN
+                            EXIT;
+                        END IF;
+                        IF receiver = 1 AND (v_answer->>'run_id' IS DISTINCT FROM v_offered->>'run_id'
+                            OR v_answer->>'acceptance_status' IS DISTINCT FROM v_offered->>'acceptance_status') THEN
+                            EXIT;
+                        END IF;
+                        IF receiver = 2 THEN
+                            v_handover := 'ACKNOWLEDGED';
+                        END IF;
+                    END LOOP;
+                EXCEPTION WHEN OTHERS THEN
+                    v_handover := 'FAILED';
+                END;
+            END IF;
+            RETURN jsonb_set(v_response, '{transformation_run,handover}', to_jsonb(v_handover));
+        END;
+        $function$;
+    '''
+
+
 def log_recovery_sql(schema='etl_ops'):
     """Durable database metadata queue and atomic, duplicate-safe delivery."""
     columns = sql.SQL(', ').join(map(sql.Identifier, (
@@ -670,6 +759,58 @@ def manage_schedule(action):
     if action == 'setup':
         setup_extraction_logs()
     with connect_source() as connection:
+        if action == 'update-handover':
+            connection.read_only = False
+            with connection.cursor() as cursor:
+                cursor.execute('''
+                    SELECT consume_function::text
+                    FROM etl_ops.extraction_handover
+                    WHERE singleton
+                ''')
+                receiver = cursor.fetchone()
+                if not receiver or receiver[0] != 'etl_ops.consume_transformation_with_load(jsonb)':
+                    raise ValueError('The configured extraction receiver changed; inspect it before updating.')
+                cursor.execute(load_handover_consumer_sql())
+            print('Stage 2-to-Load handover updated with the required batch_window.')
+            return
+        if action == 'inspect-handover':
+            # The scheduled consumer is installed in PostgreSQL.  Show the
+            # active definition so a contract fix targets the live function.
+            with connection.cursor() as cursor:
+                cursor.execute('''
+                    SELECT consume_function::text,
+                           pg_get_functiondef(consume_function::oid)
+                    FROM etl_ops.extraction_handover
+                    WHERE singleton
+                ''')
+                row = cursor.fetchone()
+            if not row:
+                print('No extraction handover receiver is configured.')
+                return
+            print(f'Configured consumer: {row[0]}')
+            print(row[1])
+            return
+        if action == 'diagnose':
+            # Keep this query read-only.  The error message identifies the
+            # failed handover contract field without re-running the pipeline.
+            with connection.cursor() as cursor:
+                cursor.execute('''
+                    SELECT load_ended_at, load_run_id, transformation_run_id,
+                           extraction_run_id, input_acceptance_status,
+                           error_code, error_message, pre_load_results
+                    FROM etl_ops.load_logs
+                    ORDER BY load_ended_at DESC
+                    LIMIT 1
+                ''')
+                row = cursor.fetchone()
+            if not row:
+                print('No load-log entries were found.')
+                return
+            labels = ('ended_at', 'load_run_id', 'transformation_run_id',
+                      'extraction_run_id', 'input_acceptance_status',
+                      'error_code', 'error_message', 'pre_load_results')
+            print(json.dumps(dict(zip(labels, row)), default=str, indent=2))
+            return
         connection.read_only = False
         if action == 'run':
             # Procedures that commit cannot be called inside a client transaction.
@@ -727,8 +868,8 @@ def manage_schedule(action):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update','recover','test-recovery'):
-        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update|recover|test-recovery')
+    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update','recover','test-recovery','diagnose','inspect-handover','update-handover'):
+        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update|recover|test-recovery|diagnose|inspect-handover|update-handover')
         return 1
     try:
         manage_schedule(sys.argv[1])
@@ -737,10 +878,13 @@ def main():
         return 1
     except psycopg.Error as error:
         print(f'Scheduling operation failed (SQLSTATE: {error.sqlstate or "unavailable"}).')
-        if error.sqlstate == '25001':
+        # PostgreSQL uses P0001 for an intentional RAISE EXCEPTION.  The
+        # scheduled procedures use that state when a pipeline stage rejects a
+        # run, so surface the server's diagnostic without exposing credentials.
+        if error.diag.message_primary:
             print(error.diag.message_primary)
-            if error.diag.context:
-                print(error.diag.context)
+        if error.diag.context:
+            print(error.diag.context)
         print('Check permissions, pg_cron, and database logs.')
         return 1
     except SourceConnectionError:
