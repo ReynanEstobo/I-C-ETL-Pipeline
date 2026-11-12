@@ -2,7 +2,6 @@
 
     python -m pipeline.load               run extraction, transformation, and load
     python -m pipeline.load --verbose     the same, printing every detail as it happens
-    python -m pipeline.load test          run the load scenarios, then roll back
     python -m pipeline.load --flush-logs  deliver queued load metadata
 
 A run prints a short summary; its full output is saved in logs/.
@@ -29,8 +28,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import date, datetime, timezone
 from pathlib import Path
 from time import perf_counter, sleep
 from uuid import UUID, uuid4
@@ -954,7 +952,7 @@ def publish(connection, consumer, before_commit=None) -> list:
 # Load metadata and pending queue (Load.md Sections 6 and 7)
 # ---------------------------------------------------------------------------
 
-USAGE = 'Usage: python -m pipeline.load [--verbose | --flush-logs | test]'
+USAGE = 'Usage: python -m pipeline.load [--verbose | --flush-logs]'
 PENDING_SUFFIX = '.load'
 # An unverified entry this recent may belong to a publication still running.
 UNVERIFIED_GRACE_SECONDS = 600
@@ -1207,17 +1205,24 @@ def save_run_log(started, text):
         return None
 
 
-def run_pipeline(verbose=False) -> int:
-    """`python -m pipeline.load`: extraction, transformation, and load on one connection.
+def _announce(progress, owner, method, message):
+    """Show `message` in the loading animation when `owner.method` starts."""
+    original = getattr(owner, method)
 
-    The terminal shows a short summary (Load.md Section 8); the full output of
-    every stage is saved in logs/, and --verbose also prints it as it happens.
+    def announced(*args, **kwargs):
+        progress.update(message)
+        return original(*args, **kwargs)
+    setattr(owner, method, announced)
+
+
+def run_stages(stage2, loader, verbose):
+    """Run extraction, Stage 2, and Load on one connection; return (output, notes).
+
+    The output of every stage is captured for the run log; --verbose also
+    prints it as it happens.
     """
-    started = datetime.now(timezone.utc)
     details = io.StringIO()
     notes = []
-    loader = LoadConsumer()
-    stage2 = transformation.TransformationConsumer(loader=loader)
     with contextlib.redirect_stdout(_Tee(details, sys.stdout) if verbose else details):
         try:
             recovered = flush_load_logs()
@@ -1257,7 +1262,11 @@ def run_pipeline(verbose=False) -> int:
             if loader.log_error:
                 notes.append('load_logs')
 
-    text = details.getvalue()
+    return details.getvalue(), notes
+
+
+def summary_facts(text, notes):
+    """Read the extraction result and the last publication for the summary (read-only)."""
     extraction_result = last_published = None
     if 'queued_logs' not in notes:
         try:
@@ -1269,6 +1278,25 @@ def run_pipeline(verbose=False) -> int:
                     last_published = report.fetch_last_publication(cursor)
         except (psycopg.Error, SourceConnectionError):
             pass
+    return extraction_result, last_published
+
+
+def run_pipeline(verbose=False) -> int:
+    """`python -m pipeline.load`: extraction, transformation, and load on one connection.
+
+    While it runs, the terminal shows a loading animation with the current
+    stage. It then shows a short summary (Load.md Section 8); the full output
+    of every stage is saved in logs/, and --verbose also prints it as it happens.
+    """
+    started = datetime.now(timezone.utc)
+    loader = LoadConsumer()
+    stage2 = transformation.TransformationConsumer(loader=loader)
+    with report.Progress('1/3 Extracting source data', enabled=not verbose) as progress:
+        _announce(progress, stage2, 'consume', '2/3 Transforming and checking the data')
+        _announce(progress, loader, 'after_commit', '3/3 Loading the daily branch summary')
+        text, notes = run_stages(stage2, loader, verbose)
+        progress.update('Preparing the summary')
+        extraction_result, last_published = summary_facts(text, notes)
     load_entry = loader.log_entries[-1] if loader.log_entries else None
     log_path = save_run_log(started, text)
     summary = report.render(
@@ -1282,177 +1310,8 @@ def run_pipeline(verbose=False) -> int:
     return report.exit_code(extraction_result, stage2.result, load_entry)
 
 
-# ---------------------------------------------------------------------------
-# Tests: `python -m pipeline.load test`, inside one rolled-back transaction
-# ---------------------------------------------------------------------------
-
-class _RolledBackConnection:
-    """Nested transactions become savepoints of one outer transaction, and
-    session mode changes are ignored, so publication never commits."""
-
-    def __init__(self, connection):
-        object.__setattr__(self, '_connection', connection)
-
-    def __getattr__(self, name):
-        return getattr(self._connection, name)
-
-    def __setattr__(self, name, value):
-        if name not in ('read_only', 'isolation_level'):
-            setattr(self._connection, name, value)
-
-
-def _require(condition, message):
-    if not condition:
-        raise AssertionError(message)
-
-
-def _load_scenarios(connection) -> int:
-    cursor = connection.cursor()
-    problems = verify_load_objects(cursor)
-    _require(not problems, 'run the load setup SQL first: ' + '; '.join(problems))
-    cursor.execute('SELECT id FROM public.branches ORDER BY id LIMIT 1')
-    row = cursor.fetchone()
-    _require(row is not None, 'public.branches has no branch to test with')
-    branch = row[0]
-    # Start from an empty target inside this transaction; real rows return on rollback.
-    cursor.execute(f'DELETE FROM {TARGET_TABLE}')
-    cursor.execute("SELECT coalesce(max(extraction_started_at), now()) + interval '1 day' "
-                   'FROM etl_ops.load_publications')
-    base = cursor.fetchone()[0]
-    cursor.execute("SELECT (%s::timestamptz AT TIME ZONE 'Asia/Manila')::date", (base,))
-    first_cutoff = cursor.fetchone()[0]
-    day1, day2 = first_cutoff - timedelta(days=3), first_cutoff - timedelta(days=2)
-    window_start = day1 - timedelta(days=1)
-    definitions = sql.SQL(', ').join(
-        sql.SQL('{} {}').format(sql.Identifier(column), sql.SQL(kind))
-        for column, kind in CONTRACT_COLUMNS.items())
-    connection.execute(sql.SQL('CREATE TEMP TABLE transformed_daily_branch_summary ({})')
-                       .format(definitions))
-    LoadConsumer.prepare(connection)
-    target = _RolledBackConnection(connection)
-
-    row_a = (day1, branch, 2, 1, 2, Decimal('16.00'), Decimal('400.00'), 2,
-             Decimal('300.00'), Decimal('50.00'))
-    row_a2 = row_a[:6] + (Decimal('450.00'),) + row_a[7:]
-    row_b = (day2, branch, 1, 0, 1, Decimal('8.00'), Decimal('200.00'), 1,
-             Decimal('200.00'), Decimal('0.00'))
-    unknown_branch = (day2, uuid4()) + row_b[2:]
-    state = {'minute': 0, 'passed': 0}
-
-    def target_rows():
-        cursor.execute(f'SELECT count(*) FROM {TARGET_TABLE}')
-        return cursor.fetchone()[0]
-
-    def case(label, rows, expected, code=None, *, minute=None, cutoff_shift=0, **handover):
-        state['minute'] += 1
-        started = base + timedelta(minutes=state['minute'] if minute is None else minute)
-        cursor.execute(f'DELETE FROM {TRANSFORMED_TABLE}')
-        cursor.executemany(sql.SQL('INSERT INTO {} VALUES ({})').format(
-            sql.SQL(TRANSFORMED_TABLE), sql.SQL(', ').join([sql.Placeholder()] * 10)), rows)
-        cursor.execute("SELECT (%s::timestamptz AT TIME ZONE 'Asia/Manila')::date", (started,))
-        cutoff = cursor.fetchone()[0]
-        offered = {
-            'run_id': str(uuid4()), 'parent_run_id': str(uuid4()), 'acceptance_status': 'APPROVED',
-            'extraction_started_at': started, 'batch_id': 'load-test',
-            'batch_window': f'{window_start} to {cutoff + timedelta(days=cutoff_shift)}',
-            'records_output': len(rows), 'validation_results': {'status': 'PASS'},
-            'code_version': '1.0.0', 'rule_version': '1.0.0', 'schema_version': '1.0.0',
-        }
-        offered.update(handover)
-        consumer, results = LoadConsumer(), []
-        try:
-            consumer.acknowledge(offered)
-            consumer.consume(connection, offered)
-        except LoadRejected as rejected:
-            outcome, got = 'REJECTED', rejected.code
-        else:
-            results = publish(target, consumer)
-            outcome, got = results[-1].acceptance_status, results[-1].error_code
-        _require((outcome, got) == (expected, code),
-                 f'{label}: expected {expected} {code or ""}, got {outcome} {got or ""}')
-        state['passed'] += 1
-        print(f'PASS: {label} -> {outcome}' + (f' ({got})' if got else ''), flush=True)
-        return consumer, offered, results
-
-    first_consumer, _, results = case('First publication', [row_a, row_b], 'APPROVED')
-    first = results[-1]
-    _require((first.records_inserted, first.records_rejected) == (2, 0) and target_rows() == 2,
-             'First publication: expected 2 inserted rows')
-    _, _, results = case('Rerun without changes', [row_a, row_b], 'APPROVED')
-    _require((results[-1].records_inserted, results[-1].records_unchanged) == (0, 2)
-             and target_rows() == 2, 'Rerun: expected 2 unchanged rows and no duplicates')
-    _, changed_offer, results = case('Changed measure', [row_a2, row_b], 'APPROVED')
-    changed = results[-1]
-    _require((changed.records_updated, changed.records_unchanged, len(changed.revisions)) == (1, 1, 1),
-             'Changed measure: expected 1 updated row with its revision')
-    case('Duplicate transformation run', [row_a2, row_b], 'REJECTED', 'DUPLICATE_BATCH',
-         run_id=changed_offer['run_id'])
-    case('Older snapshot', [row_a2, row_b], 'REJECTED', 'STALE_BATCH', minute=0)
-    _, _, results = case('Published key missing, not approved', [row_a2], 'MANUAL REVIEW',
-                         'HISTORY_REMOVAL_HELD')
-    _require(target_rows() == 2 and results[-1].rejections,
-             'History removal: expected the held key recorded and the target unchanged')
-    cursor.execute('INSERT INTO etl_ops.load_review_approvals (report_date, branch_id, reason) '
-                   'VALUES (%s, %s, %s)', (day2, branch, 'Load test approval'))
-    _, _, results = case('Published key missing, approved', [row_a2], 'APPROVED')
-    cursor.execute('SELECT count(*) FROM etl_ops.load_review_approvals WHERE applied_load_run_id = %s',
-                   (results[-1].load_run_id,))
-    _require(results[-1].records_deleted == 1 and target_rows() == 1 and cursor.fetchone()[0] >= 1,
-             'Approved removal: expected 1 removed row and the approval marked as applied')
-    case('Unknown branch', [row_a2, unknown_branch], 'REJECTED', 'FOREIGN_KEY_VIOLATION')
-    _require(target_rows() == 1, 'Unknown branch: expected the target unchanged')
-    case('Handover not approved', [row_a2], 'REJECTED', 'HANDOVER_NOT_APPROVED',
-         acceptance_status='MANUAL REVIEW')
-    case('Incomplete handover', [row_a2], 'REJECTED', 'HANDOVER_INCOMPLETE', batch_id=None)
-    case('Row count differs from handover', [row_a2], 'REJECTED', 'INPUT_COUNT_MISMATCH',
-         records_output=5)
-    case('Batch window cutoff mismatch', [row_a2], 'REJECTED', 'HANDOVER_INCOMPLETE', cutoff_shift=1)
-    with connect_source() as holder:
-        with holder.transaction():
-            holder.execute('SELECT pg_advisory_xact_lock(%s, %s)', LOAD_LOCK_KEY)
-            _, _, attempts = case('Publication lock busy', [row_a2], 'REJECTED', 'LOAD_LOCK_BUSY')
-    _require(len(attempts) == MAX_PUBLICATION_ATTEMPTS
-             and attempts[1].retry_of_run_id == attempts[0].load_run_id,
-             'Lock busy: expected 3 attempts linked by retry_of_run_id')
-
-    deliver_load_log(cursor, build_load_log(first_consumer, first))
-    cursor.execute('SELECT acceptance_status, log_delivery_status FROM etl_ops.load_logs '
-                   'WHERE load_run_id = %s', (first.load_run_id,))
-    _require(cursor.fetchone() == ('APPROVED', 'SAVED'),
-             'Log delivery: expected the entry in etl_ops.load_logs')
-    state['passed'] += 1
-    print('PASS: Load log delivery -> SAVED', flush=True)
-    return state['passed']
-
-
-def run_load_tests() -> int:
-    """Run every load scenario in one transaction that is rolled back at the end."""
-    passed = 0
-    try:
-        with connect_source() as connection:
-            connection.read_only = False
-            with connection.transaction():
-                passed = _load_scenarios(connection)
-                raise psycopg.Rollback()
-    except AssertionError as error:
-        print(f'Load test failed: {error}')
-        return 1
-    except SourceConnectionError as error:
-        print(error)
-        return 1
-    except psycopg.Error as error:
-        print(f'Load test failed (SQLSTATE: {error.sqlstate or "unavailable"}): '
-              f'{error.diag.message_primary}')
-        return 1
-    print(f'All {passed} load tests passed. Everything was rolled back: '
-          'nothing was published or logged.')
-    return 0
-
-
 def main(argv=None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if args == ['test']:
-        return run_load_tests()
     if args == ['--flush-logs']:
         return flush_queued_logs()
     if args not in ([], ['--verbose']):

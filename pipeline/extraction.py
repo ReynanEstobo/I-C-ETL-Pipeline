@@ -1,4 +1,4 @@
-"""Read the five source datasets specified in extraction.md (issue #2)."""
+"""Stage 1: read the five source datasets specified in docs/extraction/extraction.md."""
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -238,7 +238,7 @@ def extract_source(source_counts=None, staged_counts=None, run_checks=None, prep
         ) from None
 
 
-def validation_queries(source_schema='public', source_prefix=''):
+def validation_queries():
     """Shared SQL checks for both Python execution and database scheduling."""
     queries = []
 
@@ -249,7 +249,7 @@ def validation_queries(source_schema='public', source_prefix=''):
         stage = sql.Identifier('pg_temp', 'stage_' + table)
         record(table, 'row_count', sql.SQL(
             'SELECT abs((SELECT count(*) FROM {}) - (SELECT count(*) FROM {}))'
-        ).format(sql.Identifier(source_schema, source_prefix + table), stage))
+        ).format(sql.Identifier('public', table), stage))
         columns = ['id', 'order_number'] if table == 'orders' else ['id']
         for column in columns:
             field = sql.Identifier(column)
@@ -297,15 +297,11 @@ def validation_queries(source_schema='public', source_prefix=''):
     return queries
 
 
-def validate_staged_data(
-    connection: psycopg.Connection,
-    source_schema: str = 'public',
-    source_prefix: str = '',
-) -> dict:
+def validate_staged_data(connection: psycopg.Connection) -> dict:
     """Run shared SQL checks inside the extraction snapshot."""
     checks = []
     with connection.cursor() as cursor:
-        for table, name, query, warning in validation_queries(source_schema, source_prefix):
+        for table, name, query, warning in validation_queries():
             cursor.execute(query)
             affected = cursor.fetchone()[0]
             status = ('WARNING' if warning else 'FAIL') if affected else 'PASS'

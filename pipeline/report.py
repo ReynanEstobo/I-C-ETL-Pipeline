@@ -1,11 +1,15 @@
 """Short, plain-language run summaries for the terminal (docs/Load/Load.md Section 8).
 
-Both `python -m pipeline.load` and `python -m pipeline.scheduling run` print the
-same summary: one line per stage, whether the dashboard data is current, and
-what the user needs to do next.
+Both `python -m pipeline.load` and `python -m pipeline.scheduling run` show a
+one-line loading animation while the run is in progress, then print the same
+summary: one line per stage, whether the dashboard data is current, and what
+the user needs to do next.
 """
 
 import re
+import sys
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 # Asia/Manila has no daylight saving time, so a fixed +08:00 offset is exact.
@@ -34,6 +38,75 @@ LOAD_PROBLEMS = {
     'RECONCILIATION_FAILED': 'the published data did not match the received data',
     'SNAPSHOT_NOT_COMMITTED': 'the extraction did not finish',
 }
+
+
+class Progress:
+    """A one-line loading animation shown while a run is in progress.
+
+        [  ====      ] 2/3 Transforming and checking the data  0:07
+
+    It writes only to an interactive terminal and clears its line when the run
+    ends, so redirected output and the saved run log never contain it. Plain
+    ASCII keeps it readable in every Windows terminal font.
+    """
+
+    WIDTH = 12
+    BLOCK = 4
+    INTERVAL = 0.12
+
+    def __init__(self, message, *, enabled=True, stream=None):
+        self.stream = stream or sys.stdout
+        self.message = message
+        isatty = getattr(self.stream, 'isatty', None)
+        self.enabled = enabled and callable(isatty) and isatty()
+        self._stop = threading.Event()
+        self._thread = None
+        self._started = None
+        self._shown = 0
+
+    def update(self, message):
+        """Show a new stage message from the next frame on."""
+        self.message = message
+
+    def __enter__(self):
+        if self.enabled:
+            self._started = time.monotonic()
+            self._thread = threading.Thread(target=self._animate, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            self._write('\r' + ' ' * self._shown + '\r')
+        return False
+
+    @classmethod
+    def frames(cls):
+        positions = list(range(cls.WIDTH - cls.BLOCK + 1))
+        positions += positions[-2:0:-1]
+        return ['[' + ' ' * position + '=' * cls.BLOCK
+                + ' ' * (cls.WIDTH - cls.BLOCK - position) + ']' for position in positions]
+
+    def _animate(self):
+        frames = self.frames()
+        index = 0
+        while True:
+            minutes, seconds = divmod(int(time.monotonic() - self._started), 60)
+            line = f'{frames[index % len(frames)]} {self.message}  {minutes}:{seconds:02d}'
+            self._write('\r' + line + ' ' * max(0, self._shown - len(line)))
+            self._shown = max(self._shown, len(line))
+            index += 1
+            if self._stop.wait(self.INTERVAL):
+                return
+
+    def _write(self, text):
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass  # The animation must never stop a run.
 
 
 def manila_time(value) -> str:

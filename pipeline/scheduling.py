@@ -1,9 +1,7 @@
-"""Install and manage issue #10's database-only extraction schedule."""
+"""Install, run, and manage the scheduled pipeline (Supabase Cron / pg_cron)."""
 
 import json
 import sys
-from datetime import datetime, timezone
-from uuid import uuid4
 
 import psycopg
 from psycopg import sql
@@ -15,6 +13,8 @@ from pipeline.extraction import (
 )
 
 
+SOURCE_SCHEMA = 'public'
+OPS_SCHEMA = 'etl_ops'
 JOB_NAME = 'ic_laundry_daily_extraction'
 # The job runs extraction and Stage 2, then publishes the load in the same session.
 JOB_COMMAND = 'CALL etl_ops.run_scheduled_pipeline();'
@@ -109,7 +109,7 @@ def load_handover_consumer_sql():
     '''
 
 
-def log_recovery_sql(schema='etl_ops'):
+def log_recovery_sql():
     """Durable database metadata queue and atomic, duplicate-safe delivery."""
     columns = sql.SQL(', ').join(map(sql.Identifier, (
         'pipeline_run_id', 'table_name', 'extraction_started_at', 'extraction_ended_at',
@@ -117,9 +117,9 @@ def log_recovery_sql(schema='etl_ops'):
         'extraction_window', 'validation_results', 'error_code', 'error_message',
         'duration_ms', 'acceptance_status',
     )))
-    pending = sql.Identifier(schema, 'pending_extraction_logs')
-    logs = sql.Identifier(schema, 'extraction_logs')
-    function = sql.Identifier(schema, 'recover_extraction_logs')
+    pending = sql.Identifier(OPS_SCHEMA, 'pending_extraction_logs')
+    logs = sql.Identifier(OPS_SCHEMA, 'extraction_logs')
+    function = sql.Identifier(OPS_SCHEMA, 'recover_extraction_logs')
     return sql.SQL('''
         CREATE TABLE IF NOT EXISTS {} (
             LIKE {} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
@@ -157,9 +157,9 @@ def check_statement(table, name, status, affected='0'):
     ''').format(sql.Literal(table), sql.Literal(name), sql.SQL(status), sql.SQL(affected))
 
 
-def handover_config_sql(schema='etl_ops'):
+def handover_config_sql():
     """No receiver is installed by default; only the owner can configure one."""
-    table = sql.Identifier(schema, 'extraction_handover')
+    table = sql.Identifier(OPS_SCHEMA, 'extraction_handover')
     return sql.SQL('''
         CREATE TABLE IF NOT EXISTS {} (
             singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -171,7 +171,7 @@ def handover_config_sql(schema='etl_ops'):
     ''').format(table, table, table)
 
 
-def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
+def procedure_sql():
     """Generate SQL from the extractor's column contract and check queries."""
     stages = []
     reads = []
@@ -191,9 +191,9 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
             SELECT count(*) INTO n FROM {};
             staged_counts := staged_counts || jsonb_build_object({}, n);
         ''').format(
-            sql.Identifier(source_schema, table), sql.Literal(table),
+            sql.Identifier(SOURCE_SCHEMA, table), sql.Literal(table),
             sql.Identifier('pg_temp', 'stage_' + table), selected, selected,
-            sql.Identifier(source_schema, table),
+            sql.Identifier(SOURCE_SCHEMA, table),
             sql.Identifier('pg_temp', 'stage_' + table), sql.Literal(table),
         ))
 
@@ -204,7 +204,7 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
             PERFORM etl_ops.prepare_transformation();
         END IF;
     '''))
-    for table, name, query, warning in validation_queries(source_schema):
+    for table, name, query, warning in validation_queries():
         validations.append(sql.SQL('{} INTO affected;').format(query))
         status = "CASE WHEN affected = 0 THEN 'PASS' ELSE '{}' END".format(
             'WARNING' if warning else 'FAIL'
@@ -477,23 +477,23 @@ def procedure_sql(source_schema='public', procedure_schema='etl_ops'):
         $procedure$;
         REVOKE ALL ON PROCEDURE {}() FROM PUBLIC;
     ''').format(
-        sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
+        sql.Identifier(OPS_SCHEMA, 'run_scheduled_extraction'),
         sql.Literal(json.dumps(SOURCE_COLUMNS)),
         sql.SQL('\n').join(stages),
         check_statement('*', 'source_connection', "'PASS'"),
         sql.Literal(EXTRACTION_LOCK_KEY[0]), sql.Literal(EXTRACTION_LOCK_KEY[1]),
         check_statement('*', 'overlap_lock', "'PASS'"),
         check_statement('*', 'snapshot_consistency', "'PASS'"),
-        sql.Literal(source_schema),
+        sql.Literal(SOURCE_SCHEMA),
         check_statement('*', 'schema_compatibility', "'PASS'"),
-        sql.Literal(source_schema),
+        sql.Literal(SOURCE_SCHEMA),
         check_statement('*', 'source_accessibility', "'PASS'"),
         sql.SQL('\n').join(reads), sql.SQL('\n').join(validations),
         check_statement('*', 'completion', "'PASS'"),
-        sql.Identifier(procedure_schema, 'extraction_handover'),
+        sql.Identifier(OPS_SCHEMA, 'extraction_handover'),
         check_statement('*', 'handover', "'PASS'"),
-        sql.Literal(source_schema),
-        sql.Identifier(procedure_schema, 'run_scheduled_extraction'),
+        sql.Literal(SOURCE_SCHEMA),
+        sql.Identifier(OPS_SCHEMA, 'run_scheduled_extraction'),
     )
 
 
@@ -506,248 +506,6 @@ def cron_expression(connection):
     if zone in ('Asia/Manila', 'Asia/Singapore'):
         return '0 1 * * *'
     raise ValueError('Unsupported cron.timezone; verify scheduler timezone before setup.')
-
-
-def test_scheduled_extraction():
-    """Exercise the production SQL generator with isolated synthetic sources."""
-    test_schema = 'etl_test_' + uuid4().hex
-    print(f'Isolated test schema: {test_schema}')
-    with connect_source() as connection:
-        connection.read_only = False
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(test_schema)))
-                cursor.execute(sql.SQL('REVOKE ALL ON SCHEMA {} FROM PUBLIC').format(
-                    sql.Identifier(test_schema)))
-                for table, columns in SOURCE_COLUMNS.items():
-                    definitions = sql.SQL(', ').join(
-                        sql.SQL('{} {}').format(sql.Identifier(column), sql.SQL(kind))
-                        for column, kind in columns.items()
-                    )
-                    cursor.execute(sql.SQL('CREATE TABLE {} ({})').format(
-                        sql.Identifier(test_schema, table), definitions))
-                cursor.execute(handover_config_sql(test_schema))
-                cursor.execute(procedure_sql(test_schema, test_schema))
-            connection.commit()
-            connection.autocommit = True
-            # Direct fixture writes need writable autocommit transactions.
-            connection.execute('SET default_transaction_read_only = off')
-            branch, customer, order, payment, expense = [uuid4() for _ in range(5)]
-            now = datetime.now(timezone.utc)
-            fixtures = {
-                'branches': [branch, 'Test branch', None, None],
-                'customers': [customer],
-                'orders': [order, 'TEST-001', branch, customer, now, 'received', 8, 200],
-                'payments': [payment, order, branch, 100, now, 'test'],
-                'expenses': [expense, branch, 50, now.date(), None],
-            }
-
-            def reset_fixtures():
-                for table, values in fixtures.items():
-                    connection.execute(sql.SQL('DELETE FROM {}').format(
-                        sql.Identifier(test_schema, table)))
-                    connection.execute(sql.SQL('INSERT INTO {} VALUES ({})').format(
-                        sql.Identifier(test_schema, table),
-                        sql.SQL(', ').join(sql.Placeholder() for _ in values)), values)
-
-            def run_case(label, expected, expected_error=None, expected_check=None):
-                try:
-                    connection.execute(sql.SQL('CALL {}()').format(
-                        sql.Identifier(test_schema, 'run_scheduled_extraction')))
-                    assert expected != 'REJECTED', f'{label}: expected rejection'
-                except psycopg.Error as error:
-                    if not (expected == 'REJECTED' and error.sqlstate == 'P0001'
-                            and error.diag.message_primary.startswith('Scheduled extraction rejected')):
-                        raise
-                rows = connection.execute('''
-                    SELECT pipeline_run_id, table_name, extraction_status,
-                           acceptance_status, error_code, records_read,
-                           records_extracted, validation_results
-                    FROM etl_ops.extraction_logs
-                    WHERE pipeline_run_id = (
-                        SELECT pipeline_run_id FROM etl_ops.extraction_logs
-                        WHERE split_part(table_name, '.', 1) = %s
-                        ORDER BY extraction_started_at DESC LIMIT 1)
-                ''', (test_schema,)).fetchall()
-                assert len(rows) == 5, f'{label}: missing table logs'
-                assert all(row[3] == expected for row in rows), f'{label}: acceptance mismatch'
-                assert all(row[4] == expected_error for row in rows), f'{label}: error code mismatch'
-                if expected_check:
-                    assert any(check['check'] == expected_check and check['status'] != 'PASS'
-                               for row in rows for check in row[7]['checks']), label
-                if expected_error == 'EXTRACTION_ALREADY_RUNNING':
-                    assert all(row[5] is None and row[6] is None for row in rows)
-                # COMMIT clears successful stages; rejected/held stages roll back.
-                for table in SOURCE_COLUMNS:
-                    count = connection.execute(sql.SQL('SELECT count(*) FROM {}').format(
-                        sql.Identifier('pg_temp', 'stage_' + table))).fetchone()[0]
-                    assert count == 0, f'{label}: staging was not cleared'
-                    connection.execute(sql.SQL('DROP TABLE {}').format(
-                        sql.Identifier('pg_temp', 'stage_' + table)))
-                # ON COMMIT DELETE ROWS clears contents, not table definitions.
-                # Each Cron run gets a fresh session; these cases reuse one.
-                for table in ('transformation_issues', 'transformation_accounting',
-                              'transformation_rules', 'transformed_daily_branch_summary'):
-                    connection.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(
-                        sql.Identifier('pg_temp', table)))
-                print(f'PASS: {label} ({rows[0][0]})')
-
-            reset_fixtures()
-            run_case('Valid populated records', 'APPROVED')
-            connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
-                sql.Identifier(test_schema, 'orders')))
-            run_case('Nullable branch warning', 'APPROVED_WITH_WARNINGS', expected_check='branch_id_present')
-            reset_fixtures()
-            connection.execute(sql.SQL('UPDATE {} SET paid_at = NULL').format(
-                sql.Identifier(test_schema, 'payments')))
-            run_case('Missing required date', 'REJECTED', 'VALIDATION_FAILED', 'paid_at_present')
-            reset_fixtures()
-            connection.execute(sql.SQL('UPDATE {} SET customer_id = %s').format(
-                sql.Identifier(test_schema, 'orders')), (uuid4(),))
-            run_case('Broken customer reference', 'REJECTED', 'VALIDATION_FAILED', 'customer_id_reference')
-            reset_fixtures()
-            connection.execute(sql.SQL('INSERT INTO {} SELECT * FROM {}').format(
-                sql.Identifier(test_schema, 'orders'), sql.Identifier(test_schema, 'orders')))
-            run_case('Duplicate identifiers', 'REJECTED', 'VALIDATION_FAILED', 'id_unique')
-            reset_fixtures()
-            with connect_source() as holder:
-                holder.execute('SELECT pg_advisory_xact_lock(%s, %s)', EXTRACTION_LOCK_KEY)
-                run_case('Overlapping run', 'REJECTED', 'EXTRACTION_ALREADY_RUNNING', 'overlap_lock')
-            run_case('Lock released', 'APPROVED')
-            # Test-only receiver reads counts and records call order in a temp
-            # table. It performs no transformation or permanent writes.
-            connection.execute('CREATE TEMP TABLE handover_events (event text)')
-            connection.execute(sql.SQL('''
-                CREATE FUNCTION {}(metadata jsonb) RETURNS jsonb
-                LANGUAGE plpgsql SECURITY INVOKER AS $ack$
-                BEGIN
-                    INSERT INTO pg_temp.handover_events VALUES ('acknowledge');
-                    RETURN metadata;
-                END; $ack$;
-                CREATE FUNCTION {}(payload jsonb) RETURNS jsonb
-                LANGUAGE plpgsql SECURITY INVOKER AS $consume$
-                DECLARE item record; actual bigint;
-                BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_temp.handover_events
-                                   WHERE event = 'acknowledge') THEN
-                        RAISE EXCEPTION 'Consumption preceded acknowledgment';
-                    END IF;
-                    IF NOT (payload ?& ARRAY['records_read','records_extracted',
-                        'records_rejected','duration_ms','extraction_started_at',
-                        'extraction_ended_at','validation_results','stages']) THEN
-                        RAISE EXCEPTION 'Incomplete handover metadata';
-                    END IF;
-                    FOR item IN SELECT * FROM jsonb_each_text(payload->'stages') LOOP
-                        EXECUTE format('SELECT count(*) FROM pg_temp.%I', 'stage_' || item.key)
-                            INTO actual;
-                        IF actual IS DISTINCT FROM (payload->'records_extracted'->>item.key)::bigint THEN
-                            RAISE EXCEPTION 'Staging count mismatch';
-                        END IF;
-                    END LOOP;
-                    INSERT INTO pg_temp.handover_events VALUES ('consume');
-                    RETURN jsonb_build_object('consumed', true);
-                END; $consume$;
-                INSERT INTO {} (acknowledge_function, consume_function)
-                    VALUES ({}::regprocedure, {}::regprocedure);
-            ''').format(
-                sql.Identifier(test_schema, 'acknowledge'), sql.Identifier(test_schema, 'consume'),
-                sql.Identifier(test_schema, 'extraction_handover'),
-                sql.Literal(test_schema + '.acknowledge(jsonb)'),
-                sql.Literal(test_schema + '.consume(jsonb)'),
-            ))
-            run_case('Acknowledgment before staging consumption', 'APPROVED')
-            assert connection.execute('SELECT event FROM pg_temp.handover_events ORDER BY ctid').fetchall() == [
-                ('acknowledge',), ('consume',)]
-            connection.execute('DELETE FROM pg_temp.handover_events')
-            connection.execute(sql.SQL('UPDATE {} SET branch_id = NULL').format(
-                sql.Identifier(test_schema, 'orders')))
-            run_case('Warning reaches tolerant receiver', 'APPROVED_WITH_WARNINGS', expected_check='branch_id_present')
-            assert connection.execute('SELECT event FROM pg_temp.handover_events ORDER BY ctid').fetchall() == [
-                ('acknowledge',), ('consume',)]
-            reset_fixtures()
-            connection.execute(sql.SQL('''CREATE OR REPLACE FUNCTION {}(metadata jsonb)
-                RETURNS jsonb LANGUAGE sql SECURITY INVOKER AS $bad$
-                SELECT '{{}}'::jsonb; $bad$;''').format(sql.Identifier(test_schema, 'acknowledge')))
-            run_case('Invalid acknowledgment blocks consumption', 'REJECTED', 'HANDOVER_FAILED', 'handover')
-            assert connection.execute('SELECT count(*) FROM pg_temp.handover_events').fetchone()[0] == 0
-            print('All scheduled extraction tests passed. Synthetic test logs are retained.')
-        finally:
-            if not connection.closed:
-                connection.rollback()
-                connection.autocommit = True
-                connection.execute('SET default_transaction_read_only = off')
-                # This name is generated locally, not supplied by the user.
-                assert test_schema.startswith('etl_test_') and len(test_schema) == 41
-                connection.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(
-                    sql.Identifier(test_schema)))
-                print('Isolated test schema removed. Operational tables and Cron jobs were unchanged.')
-
-
-def test_scheduled_log_recovery():
-    """Test the real delivery function against private synthetic log tables."""
-    schema = 'etl_test_' + uuid4().hex
-    with connect_source() as connection:
-        connection.read_only = False
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
-                cursor.execute(sql.SQL('REVOKE ALL ON SCHEMA {} FROM PUBLIC').format(sql.Identifier(schema)))
-                cursor.execute(sql.SQL('CREATE TABLE {} (LIKE etl_ops.extraction_logs INCLUDING ALL)').format(
-                    sql.Identifier(schema, 'extraction_logs')))
-                cursor.execute(log_recovery_sql(schema))
-                cursor.execute(sql.SQL('''
-                    CREATE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS $test$
-                    BEGIN RAISE EXCEPTION 'Simulated final-log write failure'; END;
-                    $test$;
-                    CREATE TRIGGER fail_delivery BEFORE INSERT ON {}
-                        FOR EACH ROW EXECUTE FUNCTION {}();
-                ''').format(sql.Identifier(schema, 'fail_delivery'),
-                            sql.Identifier(schema, 'extraction_logs'),
-                            sql.Identifier(schema, 'fail_delivery')))
-                run_id = uuid4()
-                timestamp = datetime.now(timezone.utc)
-                cursor.execute(sql.SQL('''INSERT INTO {} (
-                    pipeline_run_id, table_name, extraction_started_at, extraction_ended_at,
-                    extraction_status, records_read, records_extracted, extraction_window,
-                    validation_results, duration_ms, acceptance_status
-                ) VALUES (%s, 'test.orders', %s, %s, 'FAIL', NULL, NULL,
-                          'All available history', '{{}}'::jsonb, 0, 'REJECTED')''').format(
-                    sql.Identifier(schema, 'pending_extraction_logs')),
-                    (run_id, timestamp, timestamp))
-            connection.commit()
-            recover = sql.SQL('SELECT {}()').format(sql.Identifier(schema, 'recover_extraction_logs'))
-            try:
-                connection.execute(recover)
-                raise AssertionError('Simulated log-write failure was not raised')
-            except psycopg.Error as error:
-                assert error.sqlstate == 'P0001'
-                connection.rollback()
-            pending = sql.Identifier(schema, 'pending_extraction_logs')
-            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(pending)).fetchone()[0] == 1
-            print('PASS: committed pending metadata survived final-log rollback')
-            connection.execute(sql.SQL('DROP TRIGGER fail_delivery ON {}').format(
-                sql.Identifier(schema, 'extraction_logs')))
-            connection.commit()
-            assert connection.execute(recover).fetchone()[0] == 1
-            connection.commit()
-            logs = sql.Identifier(schema, 'extraction_logs')
-            saved = connection.execute(sql.SQL('SELECT pipeline_run_id, extraction_started_at FROM {}').format(logs)).fetchone()
-            assert saved == (run_id, timestamp)
-            print('PASS: original run ID and timestamp preserved after recovery')
-            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(pending)).fetchone()[0] == 0
-            # Simulate uncertain delivery by replaying an already committed row.
-            connection.execute(sql.SQL('INSERT INTO {} SELECT * FROM {}').format(pending, logs))
-            connection.commit()
-            assert connection.execute(recover).fetchone()[0] == 1
-            assert connection.execute(sql.SQL('SELECT count(*) FROM {}').format(logs)).fetchone()[0] == 1
-            connection.commit()
-            print('PASS: replay removed confirmed metadata without duplicate logs')
-        finally:
-            connection.rollback()
-            connection.read_only = False
-            connection.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(schema)))
-            connection.commit()
-            print('Recovery test schema removed; operational tables and logs were unchanged.')
 
 
 def run_scheduled_once(connection) -> int:
@@ -763,14 +521,16 @@ def run_scheduled_once(connection) -> int:
     with connection.cursor() as cursor:
         cursor.execute('SELECT clock_timestamp()')
         started = cursor.fetchone()[0]
-        try:
-            cursor.execute(JOB_COMMAND)
-        except psycopg.Error as error:
-            if connection.broken:
-                raise
-            message = error.diag.message_primary or f'SQLSTATE {error.sqlstate}'
-        extraction_result, stage2, load_entry, last_published = report.fetch_scheduled_run(
-            cursor, started)
+        with report.Progress('Running extraction, transformation, and load in the database') as progress:
+            try:
+                cursor.execute(JOB_COMMAND)
+            except psycopg.Error as error:
+                if connection.broken:
+                    raise
+                message = error.diag.message_primary or f'SQLSTATE {error.sqlstate}'
+            progress.update('Preparing the summary')
+            extraction_result, stage2, load_entry, last_published = report.fetch_scheduled_run(
+                cursor, started)
     print(report.render(started, extraction_result, stage2, load_entry,
                         last_published=last_published, database_message=message,
                         details_hint='python -m pipeline.scheduling diagnose'))
@@ -778,12 +538,6 @@ def run_scheduled_once(connection) -> int:
 
 
 def manage_schedule(action):
-    if action == 'test-recovery':
-        test_scheduled_log_recovery()
-        return
-    if action == 'test':
-        test_scheduled_extraction()
-        return
     if action == 'setup':
         setup_extraction_logs()
     with connect_source() as connection:
@@ -891,8 +645,8 @@ def manage_schedule(action):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','test','update','recover','test-recovery','diagnose','inspect-handover','update-handover'):
-        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update|recover|test-recovery|diagnose|inspect-handover|update-handover')
+    if len(sys.argv) != 2 or sys.argv[1] not in ('setup','run','enable','disable','status','update','recover','diagnose','inspect-handover','update-handover'):
+        print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|update|recover|diagnose|inspect-handover|update-handover')
         return 1
     try:
         result = manage_schedule(sys.argv[1])

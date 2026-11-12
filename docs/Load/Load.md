@@ -39,9 +39,8 @@ Load must use only the handed-over rows. It must not read `public` source tables
 
 ### Load method
 
-- **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs and testing using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
+- **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
   - `python -m pipeline.load` runs extraction, transformation, and load on one connection and prints a short summary (Section 8). `--verbose` also prints every detail as it happens. Each run's full output is saved in `logs/etl-run-<date>-<time>.log`.
-  - `python -m pipeline.load test` runs the load scenarios inside one transaction that is rolled back, so nothing is published or logged.
   - `python -m pipeline.load --flush-logs` delivers queued load metadata.
 - **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction` runs `CALL etl_ops.run_scheduled_pipeline();`, which runs `etl_ops.run_scheduled_extraction()` and then publishes in the same session.
 - **Write method:** Set-based bulk SQL from the received temporary table: one `INSERT ... ON CONFLICT (report_date, branch_id) DO UPDATE` statement, plus a `DELETE` limited to approved absent keys (Section 3). Rows are not inserted one at a time, and `TRUNCATE` is not used.
