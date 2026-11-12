@@ -16,6 +16,8 @@ from pipeline import extraction
 from pipeline.connection import connect_source, SourceConnectionError
 
 VERSION = '1.0.0'
+# Stage 2 rule set, including the quarantine tolerance (transformation.md Section 10).
+RULE_VERSION = '1.2.0'
 
 
 def prepare(connection):
@@ -62,7 +64,7 @@ class TransformationConsumer:
         database_result_received = False
         self.result = {
             'run_id': str(uuid4()), 'parent_run_id': self.parent,
-            'started_at': started.isoformat(), 'rule_version': VERSION,
+            'started_at': started.isoformat(), 'rule_version': RULE_VERSION,
             'schema_version': VERSION, 'code_version': VERSION,
             'status': 'FAIL', 'acceptance_status': 'REJECTED',
             'handover': 'NOT_ATTEMPTED', 'log_delivery_status': 'PENDING',

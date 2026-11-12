@@ -1,8 +1,11 @@
 """Stage 3 load: publish the approved daily branch summary (docs/Load/Load.md).
 
     python -m pipeline.load               run extraction, transformation, and load
+    python -m pipeline.load --verbose     the same, printing every detail as it happens
     python -m pipeline.load test          run the load scenarios, then roll back
     python -m pipeline.load --flush-logs  deliver queued load metadata
+
+A run prints a short summary; its full output is saved in logs/.
 
 The target `analytics.daily_branch_summary` and the restricted `etl_ops` load
 tables are created once by a database administrator with the load setup SQL.
@@ -17,6 +20,8 @@ Load core (Load.md Sections 1, 3, 4, 5, and 8):
   post-load checks, then COMMIT or ROLLBACK, with limited retries.
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -34,7 +39,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from pipeline import extraction, transformation
+from pipeline import extraction, report, transformation
 from pipeline.connection import SourceConnectionError, connect_source
 
 LOAD_CODE_VERSION = '1.0.0'
@@ -157,8 +162,9 @@ REQUIRED_HANDOVER_FIELDS = (
     'run_id', 'parent_run_id', 'extraction_started_at', 'batch_id', 'batch_window',
     'records_output', 'validation_results', 'code_version', 'rule_version', 'schema_version',
 )
-# Dedicated advisory key, separate from extraction (...460) and log recovery (...461).
-LOAD_LOCK_KEY = (18755, 1163152462)
+# Dedicated advisory key. Other keys in use: extraction (...460), extraction log
+# recovery (...461), transformation log recovery (...462), load log recovery (...463).
+LOAD_LOCK_KEY = (18755, 1163152464)
 MAX_PUBLICATION_ATTEMPTS = 3
 # Serialization failure, deadlock, and lock not available.
 RETRYABLE_SQLSTATES = {'40001', '40P01', '55P03'}
@@ -948,7 +954,7 @@ def publish(connection, consumer, before_commit=None) -> list:
 # Load metadata and pending queue (Load.md Sections 6 and 7)
 # ---------------------------------------------------------------------------
 
-USAGE = 'Usage: python -m pipeline.load [--flush-logs | test]'
+USAGE = 'Usage: python -m pipeline.load [--verbose | --flush-logs | test]'
 PENDING_SUFFIX = '.load'
 # An unverified entry this recent may belong to a publication still running.
 UNVERIFIED_GRACE_SECONDS = 600
@@ -1158,82 +1164,122 @@ def save_load_logs(entries) -> int:
 # Manual runs: extraction, transformation, and load on one connection
 # ---------------------------------------------------------------------------
 
-def run_pipeline(flush_only=False) -> int:
-    """`python -m pipeline.load` (Load.md Section 1, manual runs)."""
-    try:
-        recovered = flush_load_logs()
-    except LOG_DELIVERY_ERRORS:
-        print('Pending load logs could not be delivered. Entries were kept; the run did not start.')
-        return 1
-    if recovered:
-        print(f'Recovered {recovered} pending load log entries.')
-    if flush_only:
-        print('Pending load-log delivery completed.')
-        return 0
-    try:
-        transformation.flush_logs()
-    except LOG_DELIVERY_ERRORS:
-        print('Pending transformation logs could not be delivered. '
-              'Entries were kept; the run did not start.')
-        return 1
+RUN_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / 'logs'
 
+
+class _Tee:
+    """Write to the details log and, with --verbose, to the terminal as well."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def flush_queued_logs() -> int:
+    """`python -m pipeline.load --flush-logs`."""
+    try:
+        delivered = flush_load_logs()
+    except LOG_DELIVERY_ERRORS:
+        print('Queued load logs could not be delivered yet. They are kept; try again later.')
+        return 1
+    print(f'Delivered {delivered} queued load log entries.' if delivered
+          else 'No queued load logs to deliver.')
+    return 0
+
+
+def save_run_log(started, text):
+    """Save a run's full output in logs/ and return its path, or None."""
+    try:
+        RUN_LOG_DIRECTORY.mkdir(exist_ok=True)
+        stamp = started.astimezone(report.MANILA).strftime('%Y%m%d-%H%M%S')
+        path = RUN_LOG_DIRECTORY / f'etl-run-{stamp}.log'
+        path.write_text(text, encoding='utf-8')
+        return path
+    except OSError:
+        return None
+
+
+def run_pipeline(verbose=False) -> int:
+    """`python -m pipeline.load`: extraction, transformation, and load on one connection.
+
+    The terminal shows a short summary (Load.md Section 8); the full output of
+    every stage is saved in logs/, and --verbose also prints it as it happens.
+    """
+    started = datetime.now(timezone.utc)
+    details = io.StringIO()
+    notes = []
     loader = LoadConsumer()
     stage2 = transformation.TransformationConsumer(loader=loader)
-    code = extraction.main(stage2)
-    if stage2.result is not None:
+    with contextlib.redirect_stdout(_Tee(details, sys.stdout) if verbose else details):
         try:
-            transformation.save_logs(stage2.result)
+            recovered = flush_load_logs()
+            transformation.flush_logs()
         except LOG_DELIVERY_ERRORS:
-            print('Transformation logs are queued but not delivered yet.')
-
-    if loader.load_run_id is not None and loader.results is None:
-        # Received but never published: a rejected receipt, or the snapshot did not commit.
-        if loader.failure is not None:
-            entry = build_load_log(loader, error_code=loader.failure.code,
-                                   error_message=str(loader.failure))
+            print('Queued logs from an earlier run could not be delivered; the run did not start.')
+            notes.append('queued_logs')
         else:
-            entry = build_load_log(
-                loader, error_code='SNAPSHOT_NOT_COMMITTED',
-                error_message='The extraction snapshot did not commit; the received batch was discarded.')
-        loader.log_entries = [entry]
+            if recovered:
+                print(f'Recovered {recovered} queued load log entries.')
+            arguments, sys.argv = sys.argv, sys.argv[:1]  # extraction reads its own arguments
+            try:
+                extraction.main(stage2)
+            finally:
+                sys.argv = arguments
+            if stage2.result is not None:
+                try:
+                    transformation.save_logs(stage2.result)
+                except LOG_DELIVERY_ERRORS:
+                    notes.append('transformation_logs')
+            if loader.load_run_id is not None and loader.results is None:
+                # Received but never published: a rejected receipt, or the snapshot did not commit.
+                if loader.failure is not None:
+                    entry = build_load_log(loader, error_code=loader.failure.code,
+                                           error_message=str(loader.failure))
+                else:
+                    entry = build_load_log(
+                        loader, error_code='SNAPSHOT_NOT_COMMITTED',
+                        error_message='The extraction snapshot did not commit; the received batch was discarded.')
+                loader.log_entries = [entry]
+                try:
+                    save_load_logs(loader.log_entries)
+                except LOG_DELIVERY_ERRORS:
+                    loader.log_error = 'not delivered'
+            for entry in loader.log_entries:
+                print(json.dumps(entry, indent=2, default=str))
+            if loader.log_error:
+                notes.append('load_logs')
+
+    text = details.getvalue()
+    extraction_result = last_published = None
+    if 'queued_logs' not in notes:
         try:
-            save_load_logs(loader.log_entries)
-        except LOG_DELIVERY_ERRORS:
-            loader.log_error = ('Load metadata was not fully delivered; it stays queued. '
-                                'Run python -m pipeline.load --flush-logs.')
-    return report_load(loader, stage2, code)
-
-
-def report_load(loader, stage2, code) -> int:
-    """Print the completion report (Load.md Section 8) and return the exit code."""
-    if not loader.log_entries:
-        print('Load did not run: no approved transformation output was offered.')
-        if code:
-            return code
-        return 2 if (stage2.result or {}).get('status') == 'WARNING' else 1
-    final = loader.log_entries[-1]
-    print(f"Load decision: {final['acceptance_status']} (load_status {final['load_status']})")
-    if final['error_code']:
-        print(f"Reason: {final['error_code']}: {final['error_message']}")
-    if len(loader.log_entries) > 1:
-        print(f'Publication attempts: {len(loader.log_entries)}')
-    print(f"Load run {final['load_run_id']}; transformation run {final['transformation_run_id']}; "
-          f"extraction run {final['extraction_run_id']}")
-    print(f"Batch window {final['batch_window']}; cutoff {final['reporting_cutoff']}; "
-          f"published dates {final['published_date_range']}")
-    print('Records: received {records_received}, inserted {records_inserted}, updated '
-          '{records_updated}, unchanged {records_unchanged}, removed {records_deleted}, '
-          'rejected {records_rejected}; quarantined input {quarantined_input_records}'.format(**final))
-    if final['acceptance_status'] == 'APPROVED' and loader.results:
-        print(f'Published to {TARGET_TABLE}; refreshed_at {loader.results[-1].refreshed_at}.')
-    elif final['acceptance_status'] == 'MANUAL REVIEW':
-        print('Publication held for review; the previous publication is unchanged. '
-              'Held keys are in etl_ops.load_rejections.')
-    else:
-        print('Nothing was published; the previous publication is unchanged.')
-    print(f"Duration {final['duration_ms']} ms. "
-          + (loader.log_error or 'Load details saved in etl_ops.load_logs.'))
-    return {'APPROVED': 0, 'MANUAL REVIEW': 2}.get(final['acceptance_status'], 1)
+            with connect_source() as connection:
+                with connection.cursor() as cursor:
+                    run_id = report.extraction_run_id(text)
+                    if run_id:
+                        extraction_result = report.fetch_extraction(cursor, run_id)
+                    last_published = report.fetch_last_publication(cursor)
+        except (psycopg.Error, SourceConnectionError):
+            pass
+    load_entry = loader.log_entries[-1] if loader.log_entries else None
+    log_path = save_run_log(started, text)
+    summary = report.render(
+        started, extraction_result, stage2.result, load_entry, last_published=last_published,
+        details_hint=log_path.relative_to(RUN_LOG_DIRECTORY.parent).as_posix() if log_path else None,
+        details=text, notes=notes)
+    print(summary)
+    if log_path:
+        with log_path.open('a', encoding='utf-8') as handle:
+            handle.write(f'\n{summary}\n')
+    return report.exit_code(extraction_result, stage2.result, load_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -1407,10 +1453,12 @@ def main(argv=None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args == ['test']:
         return run_load_tests()
-    if args not in ([], ['--flush-logs']):
+    if args == ['--flush-logs']:
+        return flush_queued_logs()
+    if args not in ([], ['--verbose']):
         print(USAGE)
         return 1
-    return run_pipeline(flush_only=args == ['--flush-logs'])
+    return run_pipeline(verbose=args == ['--verbose'])
 
 
 if __name__ == '__main__':

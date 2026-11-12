@@ -8,6 +8,7 @@ from uuid import uuid4
 import psycopg
 from psycopg import sql
 
+from pipeline import report
 from pipeline.connection import SourceConnectionError, connect_source
 from pipeline.extraction import (
     EXTRACTION_LOCK_KEY, SOURCE_COLUMNS, setup_extraction_logs, validation_queries,
@@ -749,6 +750,33 @@ def test_scheduled_log_recovery():
             print('Recovery test schema removed; operational tables and logs were unchanged.')
 
 
+def run_scheduled_once(connection) -> int:
+    """`python -m pipeline.scheduling run`: run the Cron command once, then summarize it.
+
+    The summary is built from the run's extraction, transformation, and load
+    logs (Load.md Section 8). A stage that stops the run raises an exception in
+    the procedure; its message is shown when the logs do not explain it.
+    """
+    # Procedures that commit cannot be called inside a client transaction.
+    connection.autocommit = True
+    message = None
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT clock_timestamp()')
+        started = cursor.fetchone()[0]
+        try:
+            cursor.execute(JOB_COMMAND)
+        except psycopg.Error as error:
+            if connection.broken:
+                raise
+            message = error.diag.message_primary or f'SQLSTATE {error.sqlstate}'
+        extraction_result, stage2, load_entry, last_published = report.fetch_scheduled_run(
+            cursor, started)
+    print(report.render(started, extraction_result, stage2, load_entry,
+                        last_published=last_published, database_message=message,
+                        details_hint='python -m pipeline.scheduling diagnose'))
+    return report.exit_code(extraction_result, stage2, load_entry)
+
+
 def manage_schedule(action):
     if action == 'test-recovery':
         test_scheduled_log_recovery()
@@ -813,12 +841,7 @@ def manage_schedule(action):
             return
         connection.read_only = False
         if action == 'run':
-            # Procedures that commit cannot be called inside a client transaction.
-            connection.autocommit = True
-            with connection.cursor() as cursor:
-                cursor.execute(JOB_COMMAND)
-            print('Scheduled pipeline run completed. Inspect the extraction, transformation, and load logs.')
-            return
+            return run_scheduled_once(connection)
         if action == 'update':
             with connection.cursor() as cursor:
                 cursor.execute(log_recovery_sql())
@@ -872,7 +895,7 @@ def main():
         print('Usage: python -m pipeline.scheduling setup|run|enable|disable|status|test|update|recover|test-recovery|diagnose|inspect-handover|update-handover')
         return 1
     try:
-        manage_schedule(sys.argv[1])
+        result = manage_schedule(sys.argv[1])
     except ValueError as error:
         print(error)
         return 1
@@ -890,7 +913,7 @@ def main():
     except SourceConnectionError:
         print('Scheduling operation failed. Check permissions, pg_cron, and database logs.')
         return 1
-    return 0
+    return result if isinstance(result, int) else 0
 
 
 if __name__ == '__main__':

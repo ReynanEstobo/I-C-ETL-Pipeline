@@ -40,7 +40,7 @@ Load must use only the handed-over rows. It must not read `public` source tables
 ### Load method
 
 - **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs and testing using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
-  - `python -m pipeline.load` runs extraction, transformation, and load on one connection.
+  - `python -m pipeline.load` runs extraction, transformation, and load on one connection and prints a short summary (Section 8). `--verbose` also prints every detail as it happens. Each run's full output is saved in `logs/etl-run-<date>-<time>.log`.
   - `python -m pipeline.load test` runs the load scenarios inside one transaction that is rolled back, so nothing is published or logged.
   - `python -m pipeline.load --flush-logs` delivers queued load metadata.
 - **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction` runs `CALL etl_ops.run_scheduled_pipeline();`, which runs `etl_ops.run_scheduled_extraction()` and then publishes in the same session.
@@ -73,14 +73,18 @@ In scheduled runs, `etl_ops.consume_transformation_with_load(jsonb)` is the cons
 - Each run replaces the complete completed-day history. The workload grows with history, roughly 1,000 rows per year, which is small for PostgreSQL. Reassess before history spans many years or more branches are added.
 - Released orders are grouped by creation date (Stage 2, B-04). A later status change can revise an earlier published date. This is an expected update, not an error.
 - `unique_customer_count` is distinct within one date and branch. Adding it across dates or branches overcounts customers, so reports must not sum it.
-- **Pipeline role:** Load runs in the same session as extraction and transformation, so the dedicated role `ic_etl_runtime` runs the whole pipeline. It holds:
-  - **Source access:** SELECT on the required `public` source columns. When row-level security is enabled on the five source tables, the role needs the `BYPASSRLS` attribute or a SELECT policy on each of them, so it sees every source row.
+- **Pipeline account:** Load runs in the same session as extraction and transformation, so one database account runs the whole pipeline. Manual runs connect as the project's `postgres` account, and the Cron job `ic_laundry_daily_extraction` runs as `postgres`, the account that scheduled it.
+  - `postgres` owns the source, `analytics`, and `etl_ops` tables and has the `BYPASSRLS` attribute, so it reads every source row even though row-level security is enabled on the source tables.
+  - The read-only snapshot transaction keeps extraction, transformation, and receipt from writing permanent tables. Only the publication transaction writes, and only to `analytics.daily_branch_summary` and the `etl_ops` load tables.
+  - The write-permission check in Section 4 confirms the account's privileges before every publication.
+- **Planned least-privilege role:** `postgres` can also change source data and schemas, which the pipeline never needs. Before production, the runs can move to a dedicated role, `ic_etl_runtime`, which is not created yet. It would hold:
+  - **Source access:** SELECT on the required `public` source columns, plus the `BYPASSRLS` attribute or a SELECT policy on each of the five source tables, so it sees every source row.
   - **Session:** TEMPORARY on the database, and USAGE on the `analytics` and `etl_ops` schemas.
   - **Stage 1 and Stage 2:** EXECUTE on `etl_ops.run_scheduled_extraction()` and on the `etl_ops` extraction, transformation, and log-recovery functions. SELECT and INSERT on the extraction and transformation log, pending-log, and quarantine tables, and DELETE on their pending-log tables. SELECT on `etl_ops.extraction_handover` and `etl_ops.transformation_handover`.
   - **Load:** SELECT, INSERT, UPDATE, and DELETE on `analytics.daily_branch_summary`. SELECT and INSERT on `etl_ops.load_publications`, `etl_ops.load_logs`, `etl_ops.pending_load_logs`, and `etl_ops.load_rejections`, and DELETE on `etl_ops.pending_load_logs`. SELECT and UPDATE on `etl_ops.load_review_approvals`, to mark approvals as applied.
-  - **Scheduling:** USAGE on the `cron` schema. The Cron job is created while connected as `ic_etl_runtime`, because `pg_cron` runs each job as the role that scheduled it.
+  - **Scheduling:** USAGE on the `cron` schema. The Cron job would be re-created while connected as `ic_etl_runtime`, because `pg_cron` runs each job as the role that scheduled it.
   - **Never granted:** TRUNCATE, DDL, or INSERT, UPDATE, and DELETE on `public` tables.
-- Scheduled and production runs must use `ic_etl_runtime`, never the project's `postgres` account, which is limited to local development and testing. Before the first scheduled run, and after any row-level security change, compare the source row counts seen by `ic_etl_runtime` with those seen by `postgres`. Extraction compares source and staging counts using the same role, so a role that cannot see some rows would pass that check while missing history.
+- When the runs move to `ic_etl_runtime`, and after any later row-level security change, compare the source row counts it sees with those seen by `postgres`. Extraction compares source and staging counts using the same role, so a role that cannot see some rows would pass that check while missing history.
 - Passwords and connection strings stay in the local `.env` file or Supabase secrets, never in documentation or logs.
 - A database administrator creates the target, indexes, and load metadata tables once by running the load setup SQL in the Supabase SQL Editor. The scheduled-load SQL then adds the scheduled functions, configures `etl_ops.transformation_handover`, and sets the storage limit in `etl_ops.load_settings`. The daily load never runs DDL; it only checks that those objects match Section 2.
 - Writes take `ROW EXCLUSIVE` locks, which do not block readers. Dashboards continue to read the previous publication until the publication transaction commits.
@@ -317,7 +321,7 @@ Stage 1 and Stage 2 logs use the same one-year retention period. It is long enou
 
 | Role | Read | Write | Delete |
 | --- | --- | --- | --- |
-| ETL runtime role (`ic_etl_runtime`) | Target, publication records, load logs, approvals, and the Stage 1 and Stage 2 objects listed in Section 1 | Target rows; inserts into publication records, load logs, pending logs, and rejections; marks approvals as applied | Delivered pending entries only |
+| Pipeline account (`postgres` today; `ic_etl_runtime` once created) | Target, publication records, load logs, approvals, and the Stage 1 and Stage 2 objects listed in Section 1 | Target rows; inserts into publication records, load logs, pending logs, and rejections; marks approvals as applied | Delivered pending entries only |
 | ETL operator | Load logs, rejections, approvals | Removal approvals after manual review | None |
 | Database administrator | All load objects | Grants and versioned DDL | Archive and delete logs after retention, using the procedure below |
 | Application reporting role | `analytics.daily_branch_summary` only | None | None |
@@ -365,18 +369,21 @@ Only lock and serialization errors are retried: up to 3 publication attempts in 
 
 ### Notification
 
-Manual runs print the decision. Scheduled runs raise an exception for `MANUAL REVIEW` and `REJECTED`, so the job appears as failed in `cron.job_run_details`. The ETL operator checks `cron.job_run_details` and `etl_ops.load_logs` every morning before branches open (by 07:00 Asia/Manila). The operator notifies the data owner of manual reviews, and the database administrator of permission, storage, or schema failures.
+Manual runs print a short summary with what to do next, and `python -m pipeline.scheduling run` prints the same summary for a scheduled run. Scheduled runs raise an exception for `MANUAL REVIEW` and `REJECTED`, so the job appears as failed in `cron.job_run_details`. The ETL operator checks `cron.job_run_details` and `etl_ops.load_logs` every morning before branches open (by 07:00 Asia/Manila). The operator notifies the data owner of manual reviews, and the database administrator of permission, storage, or schema failures.
 
 ### Completion and handover
 
-A completed load reports:
+A completed run shows a short terminal summary:
 
-- The final decision
-- The `load_run_id`, transformation run ID, and extraction run ID
-- The batch window and cutoff
-- The received, inserted, updated, unchanged, removed, and rejected counts
-- The quarantined input count
-- `refreshed_at` and the duration
+- One line per stage (Extract, Transform, Load) with its decision: OK, ON HOLD, FAILED, or SKIPPED
+- The received, new, changed, unchanged, and removed counts
+- The quarantined count and the rate of the most affected stream, against its limit
+- The date the dashboard data is current through, or the last good run when nothing was published
+- What to do next, with the command to run
+
+The command ends with exit code 0 when the batch was published, 2 when it was held for MANUAL REVIEW, and 1 when it was rejected or failed, so a script or task scheduler can tell the outcomes apart.
+
+The full completion report is kept outside the terminal. The run's log file in `logs/` and `etl_ops.load_logs` hold the `load_run_id`, transformation and extraction run IDs, batch window and cutoff, rejected count, `refreshed_at`, and duration.
 
 Downstream users learn of new data through the published rows themselves. Dashboards display "Completed days through the day before `reporting_cutoff`, refreshed `refreshed_at`". When no publication occurs, the previous rows stay visible with an older `refreshed_at`, so users can see that today's refresh has not completed.
 
@@ -393,8 +400,8 @@ Downstream users learn of new data through the published rows themselves. Dashbo
 | Published history silently disappears | A source correction, cancellation, or Stage 2 quarantine removes all activity for a date and branch | Historical reports change without explanation | The history-removal check holds publication until removal is approved per key; previous values are kept in `revisions` |
 | Foreign-key violation on `branch_id` | Branch deleted after the snapshot | Batch rejected | Reject and rerun. Deactivate branches in the application rather than deleting them; the foreign key also blocks deleting branches that have history |
 | Target schema drift | Manual `ALTER` or a migration without a contract update | Insert errors or misaligned columns | Schema-match check; versioned migrations updated together with the Stage 2 `schema_version` |
-| Permission denied or excess privileges | Missing Stage 1, Stage 2, or Load grants for `ic_etl_runtime`, or scheduling the job as the broader `postgres` account | The run fails, or the role can change source data | Grant the full pipeline privilege list in Section 1; privilege pre-check; never schedule the job as `postgres` |
-| Incomplete source history | Row-level security hides some source rows from `ic_etl_runtime` | Summaries understate activity, while extraction counts still match because the same role reads source and staging | `BYPASSRLS` or SELECT policies on the five source tables; compare row counts with the `postgres` account before the first scheduled run and after policy changes |
+| Permission denied or excess privileges | A missing Stage 1, Stage 2, or Load grant; or the broad `postgres` account, which can also change source data | The run fails, or a faulty change could reach source data | Privilege pre-check before every publication; the read-only snapshot keeps extraction from writing; move the runs to `ic_etl_runtime` with the Section 1 grants before production |
+| Incomplete source history | Row-level security hides some source rows from a pipeline role without `BYPASSRLS`, for example after the move to `ic_etl_runtime` | Summaries understate activity, while extraction counts still match because the same role reads source and staging | `BYPASSRLS` or SELECT policies on the five source tables; compare row counts with the `postgres` account after the move and after policy changes |
 | Commit outcome unknown | Connection drops during `COMMIT` | Unclear whether the batch was published | Before any rerun, look up the `load_run_id` in `etl_ops.load_publications`, then finalize the queued log entry; never republish blindly |
 | Log delivery fails after publication | Logging transaction fails | Batch published but not fully logged | Pending queue and replay; never repeat the publication because of a log failure. Duplicate and freshness checks read `etl_ops.load_publications`, not the logs |
 | Lock waits or timeouts | A long reporting query or maintenance holds a conflicting lock | Load delayed | `lock_timeout` and `statement_timeout`, limited retries, 01:00 off-peak schedule |

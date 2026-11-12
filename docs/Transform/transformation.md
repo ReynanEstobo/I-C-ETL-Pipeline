@@ -28,15 +28,30 @@ Transformation must read the supplied staging tables, not re-extract records fro
 
 ### Batch processing method
 
-SQL will perform profiling, cleaning, standardization, business calculations, and validation inside PostgreSQL. Records must remain in the database. Transformation must use working copies or derived temporary outputs while preserving the raw extraction stages. Create empty temporary working and output tables during the setup transaction before the read-only extraction snapshot begins; populate and update them within the shared snapshot. Do not create these tables inside the read-only transaction.
+SQL inside PostgreSQL performs cleaning, standardization, business calculations, and validation. Records remain in the database.
 
-The batch must run daily immediately after approved extraction in the **01:00 Asia/Manila** pipeline execution. It must use the active extraction handover rather than a separately scheduled connection, because temporary staging is session-local.
+- **Rules:** `etl_ops.consume_transformation_strict(jsonb)` applies the rules in Sections 3 to 5 and the checks in Section 7.
+- **Tolerance:** `etl_ops.consume_transformation(jsonb)` wraps it and applies the quarantine tolerance in Section 10.
+- **Profiling:** a separate read-only step, `python -m pipeline.profiling` (Section 2).
+- **Manual runs:** `pipeline/transformation.py` calls the same function on the extraction connection. `python -m pipeline.transformation` runs Stages 1 and 2 only, and `python -m pipeline.load` runs all three stages.
+- **Scheduled runs:** the extraction procedure calls `etl_ops.consume_transformation_with_load(jsonb)`, which runs Stage 2 and passes an approved result to Load.
+
+Transformation never modifies the raw extraction stages. It reads the staged rows directly and applies cleaning and standardization as expressions in its queries, for example `lower(btrim(status))`. It writes only to derived temporary tables. `etl_ops.prepare_transformation()` creates those empty tables in the setup transaction, before the read-only extraction snapshot begins:
+
+- `transformation_issues`
+- `transformation_accounting`
+- `transformation_rules`
+- `transformed_daily_branch_summary`
+
+They are populated within the shared snapshot and never created inside the read-only transaction.
+
+The batch runs daily immediately after approved extraction in the **01:00 Asia/Manila** pipeline execution. It uses the active extraction handover rather than a separately scheduled connection, because temporary staging is session-local.
 
 Each batch must process the full staged history and rebuild the eligible completed-day measures. This allows subsequent batches to incorporate historical corrections and late collections. Orders use their creation dates, payments use their collection dates, and expenses use their recorded expense dates.
 
 If transformation fails, stop handover to Load and discard incomplete transformed output. After the transaction ends, restart through the Extraction Stage to obtain a new approved snapshot and extraction run ID. Transformation must not attempt to reuse temporary tables from a closed connection.
 
-Reruns must be idempotent: the same staged input, reporting cutoff, and transformation rules must produce the same business rows without appending duplicates. At the start of each batch, the temporary working, issue, accounting, rule, and transformed-output tables are cleared before they are repopulated. A new extraction snapshot may legitimately change historical results when source records have been corrected.
+Reruns must be idempotent: the same staged input, reporting cutoff, and transformation rules must produce the same business rows without appending duplicates. At the start of each batch, the temporary issue, accounting, rule, and transformed-output tables are cleared before they are repopulated. A new extraction snapshot may legitimately change historical results when source records have been corrected.
 
 ### Transformation scope
 
@@ -48,17 +63,17 @@ Reruns must be idempotent: the same staged input, reporting cutoff, and transfor
 | `stage_payments` | `id`, `order_id`, `branch_id`, `paid_at`, `amount` | Retain payment and order references; standardize collection dates; calculate payment counts and cash received. |
 | `stage_expenses` | `id`, `branch_id`, `expense_date`, `amount`, `deleted_at` | Retain expense references and dates; exclude soft-deleted expenses with recorded counts; calculate expense totals. |
 
-Orders, payments, and expenses must be aggregated independently by business date and branch before their results are combined. The resulting dataset must contain one row per reporting date and branch for handover to Load. Detailed cleaning, standardization, and business rules will be defined in the corresponding transformation sections.
+Orders, payments, and expenses must be aggregated independently by business date and branch before their results are combined. The resulting dataset must contain one row per reporting date and branch for handover to Load. Sections 3 to 5 define the detailed cleaning, standardization, and business rules.
 
 ### Dependencies and assumptions
 
 - Process branch and customer reference lookups before the related transaction datasets. Resolve payment order references against staged orders before aggregating payments.
 - Required staging tables, selected columns, and extraction metadata must match the Stage 1 handover contract. Missing staging or unavailable lookups stop the batch; transformation must not fetch replacement source data.
-- Required branch assignments and reporting dates must be resolved before reporting output is approved. Transformation must not silently assign a default branch or date.
+- A fact row without a resolvable branch or reporting date is quarantined under C-06 and counts toward the Section 10 rate. Transformation never assigns a default branch or date.
 - Convert order and payment timestamps to Asia/Manila business dates. Preserve `expense_date` as its existing calendar date.
 - Monetary values represent PHP and weights represent kilograms. Use exact PostgreSQL `NUMERIC` arithmetic for calculations.
 - Full-history processing includes late payments and historical corrections in subsequent runs. Its workload grows with the staged history.
-- Temporary staging and transformed output must be consumed before the active transaction and connection end. The existing extraction transaction permits writes to temporary tables but is read-only for permanent tables; permanent publication requires a compatible transaction design when integrating the Load Stage.
+- Temporary staging and transformed output must be consumed before the active transaction and connection end. The extraction transaction permits writes to temporary tables but is read-only for permanent tables. Load therefore copies the approved output during the snapshot and publishes it afterwards in a separate read-write transaction in the same session ([Load Stage, Section 1](../Load/Load.md#transaction-design)).
 
 ## 2. Data Profiling and Issue Identification
 
@@ -117,9 +132,17 @@ The following register records the measured findings for the approved profiling 
 
 Business exclusions, date-window deferrals, and multiple payments per order are distinct from data quality errors. Profiling must preserve all staged records. Each observed issue must reference its cleaning, standardization, or business rule in Sections 3, 4, or 5. A completed profile must contain measured findings and planned treatments for an identified batch.
 
+### Issues found by later runs
+
+Every Stage 2 run records its findings as quarantine evidence (Section 9), so issues that appear after profiling are measured too. Between 2026-11-04 and 2026-11-12, 26 runs quarantined the same record:
+
+| Table and column | Issue type | Sample | Affected records | Treatment |
+| --- | --- | --- | --- | --- |
+| `stage_orders.weight_kg` | Invalid value (negative weight) | `-2` on order `INVALID-NEGATIVE-WEIGHT` | 1 of 35 orders (2.9%) in the latest of those runs | C-04: quarantined, within the 5% tolerance. Corrected at the source on 2026-11-12 with `python -m pipeline.quarantine --fix` (`-2` to `2`). |
+
 ## 3. Data Cleaning Rules
 
-Cleaning must operate on temporary working copies and preserve raw staging. The measured profiling findings in Section 2 identify the targets below. Rule counts must distinguish changed, quarantined, and retained rows. A row-level issue in `orders`, `payments`, or `expenses` is evaluated by the tolerance policy in Section 10: the affected row may be quarantined while unrelated valid rows continue. Schema, source-access, dimension, reconciliation, and output-contract failures remain batch-stopping failures.
+Cleaning never changes raw staging. The rules evaluate the staged rows directly, and a correction such as trimming applies only to the derived values. The measured profiling findings in Section 2 identify the targets below. Rule counts must distinguish changed, quarantined, and retained rows. A row-level issue in `orders`, `payments`, or `expenses` is evaluated by the tolerance policy in Section 10: the affected row may be quarantined while unrelated valid rows continue. Schema, source-access, dimension, reconciliation, and output-contract failures remain batch-stopping failures.
 
 | Rule ID | Target | Condition | Action | Justification |
 | --- | --- | --- | --- | --- |
@@ -127,35 +150,35 @@ Cleaning must operate on temporary working copies and preserve raw staging. The 
 | C-02 | Required labels and statuses | NULL, blank after trimming, or embedded control characters | Quarantine the affected fact row and log it; a bad branch or customer dimension stops the batch | No reliable replacement can be inferred |
 | C-03 | Weight and monetary fields | NULL or non-finite numeric value | Quarantine the affected fact row and log it | These values cannot support valid reporting totals |
 | C-04 | Order weight | Negative value | Quarantine the affected order and log it | Negative weight cannot represent laundry demand |
-| C-05 | IDs and order numbers | Duplicate identifier in working data | Quarantine every duplicate fact row; a duplicate branch or customer dimension stops the batch | No extracted update timestamp establishes which version is authoritative |
+| C-05 | IDs and order numbers | Duplicate identifier in the staged data | Quarantine every duplicate fact row; a duplicate branch or customer dimension stops the batch | No extracted update timestamp establishes which version is authoritative |
 | C-06 | Required references and dates | Missing value or unmatched staged parent | Quarantine the affected fact row; a failed branch or customer dimension stops the batch | Prevent incorrect branch, customer, order, or date attribution |
 | C-07 | Payment branch versus order branch | Different valid branch IDs | Quarantine the payment and log it for review | Cross-branch collection handling requires an approved business rule |
 | C-08 | Order value and expense amount | Negative value | Quarantine the affected row and log it for review | Refund and adjustment semantics must be defined before negative amounts contribute to reporting |
 | C-09 | Payment amount | Zero or negative value | Quarantine the payment and log it | The source schema requires payment amount greater than zero |
 
-Duplicate detection must use identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. When a duplicate identifier is found, no duplicate record is kept and the batch is rejected because the source provides no update timestamp for selecting an authoritative version.
+Duplicate detection uses identifiers, not repeated amounts or payment order references. Multiple payments for one order are valid distinct records when payment IDs differ. When a duplicate identifier is found, no copy is kept, because the source provides no update timestamp for selecting an authoritative version. Every copy of a duplicated order, payment, or expense is quarantined. A duplicated branch or customer stops the batch.
 
 Unusually large finite values must be reviewed using measured profiles; no unverified threshold may silently remove them. Business exclusions such as deleted expenses belong to Section 5.
 
-Each rejected row must be counted once, with all applicable rule IDs retained. Modified rows remain part of retained input. Missing values must not be replaced with zero merely to make calculations succeed. Link actual profiling findings to these rules when Section 2 measurements are available.
+Each rejected row must be counted once, with all applicable rule IDs retained. Modified rows remain part of retained input. Missing values are never replaced with zero merely to make calculations succeed. Section 2 links each measured finding to the rule that treats it.
 
 ## 4. Standardization and Data Type Rules
 
-Standardization must preserve business meaning and operate on the cleaned working datasets.
+Standardization preserves business meaning and applies to the cleaned values derived from the staged rows.
 
 | Rule ID | Target | Standard and conversion | On failure |
 | --- | --- | --- | --- |
-| S-01 | Order and payment timestamps | Derive DATE using `(timestamp_value AT TIME ZONE 'Asia/Manila')::date`; retain original TIMESTAMPTZ for traceability | Reject missing or non-finite required dates |
-| S-02 | Expense date | Preserve DATE without timezone conversion; display as YYYY-MM-DD | Reject invalid required date |
-| S-03 | Order status | Lowercase trimmed text; validate against a versioned approved status mapping | Hold unknown codes for review; do not guess their meaning |
+| S-01 | Order and payment timestamps | Derive DATE using `(timestamp_value AT TIME ZONE 'Asia/Manila')::date`; retain original TIMESTAMPTZ for traceability | Quarantine a row with a missing or non-finite timestamp; recorded under C-06 |
+| S-02 | Expense date | Preserve DATE without timezone conversion; display as YYYY-MM-DD | Quarantine a row with a missing or non-finite date; recorded under C-06 |
+| S-03 | Order status | Lowercase trimmed text; validate against a versioned approved status mapping | Quarantine an order with an unknown code and log it for review; do not guess its meaning |
 | S-04 | Branch label | Preserve spelling and case after C-01 trimming | Reject unusable labels under C-02 |
 | S-05 | Weight and amounts | Use exact NUMERIC for intermediate calculations; round each final group total once to two decimals for NUMERIC(14,2) | Reject non-finite values or totals outside the target range |
-| S-06 | Identifiers and counts | Retain UUID identifiers; use BIGINT counts | Reject incompatible types or overflow |
-| S-07 | Run timestamps | Preserve TIMESTAMPTZ; display ISO 8601 with timezone offset | Reject unparseable required metadata |
+| S-06 | Identifiers and counts | Retain UUID identifiers; use BIGINT counts | An incompatible input type stops extraction (Stage 1 schema check); an overflowing total is recorded under S-05 |
+| S-07 | Run timestamps | Preserve TIMESTAMPTZ; display ISO 8601 with timezone offset | Unparseable run metadata fails the run with `TRANSFORMATION_FAILED` |
 
 Currency is PHP and weight is kilograms. No currency or unit conversion is performed. Numeric source values are already typed; do not convert through floating-point arithmetic or formatted currency strings.
 
-Rule version `1.0.0` recognizes the source schema's codes `received`, `on_process`, `ready`, `released`, and `cancelled`. The first four contribute to eligible order measures; `released` also contributes to released-order counts. Cancelled orders are excluded from order measures. Case and whitespace normalization does not authorize mapping unfamiliar codes to existing statuses. Unknown statuses hold the batch for review. Record the mapping version and changed-row counts.
+The status mapping, unchanged since rule version `1.0.0`, recognizes the source schema's codes `received`, `on_process`, `ready`, `released`, and `cancelled`. The first four contribute to eligible order measures; `released` also contributes to released-order counts. Cancelled orders are excluded from order measures. Case and whitespace normalization does not authorize mapping unfamiliar codes to existing statuses. An order with an unknown status is quarantined and counts toward the Section 10 rate, so a widespread new status holds or rejects the batch. The rule version and the changed-row counts (C-01, S-03) are recorded in the metadata.
 
 Rounding must occur after aggregation, not once per source row. Validate the rounded result before casting to NUMERIC(14,2). Conversion failures must be logged with the rule ID and affected record or group; they must not become silent NULLs or zeroes.
 
@@ -163,20 +186,20 @@ Rounding must occur after aggregation, not once per source row. Validate the rou
 
 Transform eligible working records into one daily branch summary. Reuse the captured reporting cutoff for the entire batch.
 
-| Rule ID | Input | Logic | Output / purpose |
-| --- | --- | --- | --- |
-| B-01 | Order and payment timestamps; expense dates | Use S-01/S-02 business dates; retain only dates earlier than the cutoff | Completed-day reporting; count deferred rows separately |
-| B-02 | Standardized order status | Exclude orders mapped to the approved cancelled code; record count and reason | Eligible order activity and value |
-| B-03 | Expense deletion timestamp | Exclude expenses with non-NULL deleted_at | Eligible expense totals |
-| B-04 | Eligible orders | Group by order business date and branch_id | order_count, released_order_count, unique_customer_count, total_weight_kg, order_value_php |
-| B-05 | Eligible payments | Group by collection business date and payment branch_id | payment_count and cash_received_php |
-| B-06 | Eligible expenses | Group by expense_date and branch_id | expense_total_php |
-| B-07 | Three aggregate datasets | Union distinct date/branch keys, then left join each aggregate on both keys | One row per date and branch; zero for an absent stream |
-| B-08 | Staged branch/customer/order references | Resolve UUID lookups with exactly one matching parent | Stable relationships without multiplying detail rows |
+| Rule ID | Input columns | Logic | Output column | Business reason |
+| --- | --- | --- | --- | --- |
+| B-01 | `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | Use the S-01/S-02 business date; keep dates earlier than the cutoff and count later rows as deferred | (filter) | Reports cover completed days only, because the current day is still changing |
+| B-02 | `orders.status` | Exclude orders mapped to `cancelled`; record the count and reason | (filter) | Cancelled orders are not laundry demand or order value |
+| B-03 | `expenses.deleted_at` | Exclude expenses with a non-NULL `deleted_at`; record the count | (filter) | Deleted expenses were withdrawn in the application |
+| B-04 | Eligible orders: `branch_id`, `customer_id`, `status`, `weight_kg`, `total_price` | Group by order business date and `branch_id`; count orders, count `released` orders, count distinct `customer_id`, sum weight and value | `order_count`, `released_order_count`, `unique_customer_count`, `total_weight_kg`, `order_value_php` | Daily demand, completions, customer activity, and order value per branch |
+| B-05 | Eligible payments: `branch_id`, `amount` | Group by collection business date and payment `branch_id`; count and sum | `payment_count`, `cash_received_php` | Cash is reported on the day it was collected, separately from order value |
+| B-06 | Eligible expenses: `branch_id`, `amount` | Group by `expense_date` and `branch_id`; sum | `expense_total_php` | Daily branch expenses on their recorded date |
+| B-07 | B-04, B-05, and B-06 results | Union the distinct date and branch keys, then left join each aggregate on both keys; 0 for an absent stream | `report_date`, `branch_id`, and all measures | One row per date and branch without multiplying detail rows |
+| B-08 | `orders.branch_id`, `orders.customer_id`, `payments.order_id`, `payments.branch_id`, `expenses.branch_id` | Each reference must match exactly one staged parent (checked by C-06) | (lookup) | Stable branch and customer attribution without row multiplication |
 
 For B-04, count eligible orders, count those mapped to released, count distinct customer_id, and sum weight_kg and total_price. Released orders are grouped by creation date; no release-event timestamp is available. A status change can therefore revise historical results.
 
-Payments remain independent ledger entries. A payment on a cancelled order must not be discarded solely because that order is excluded from order metrics. Negative amounts and cross-branch collections cannot proceed until the review requirements in Section 3 are resolved. Cancellation and release mappings must be approved before deployment; unknown statuses must never be treated implicitly as eligible.
+Payments remain independent ledger entries. A payment on a cancelled order is not discarded solely because that order is excluded from order metrics. Negative amounts and cross-branch collections are quarantined under C-07 and C-08 until the source record is corrected or a business rule is approved. The cancellation and release mappings are approved in the rule version; unknown statuses are never treated as eligible.
 
 Never join raw orders, payments, and expenses together for aggregation. Each stream must first produce unique date/branch keys. A day with payments or expenses but no eligible orders must remain in the output. A date/branch with no eligible activity in any stream has no output row.
 
@@ -186,20 +209,20 @@ Assign each input row one accounting category in this order: rejected, business-
 
 ## 6. Transformed Data Contract and Naming Convention
 
-The Load Stage receives `pg_temp.transformed_daily_branch_summary` in the active connection. All fields below are NOT NULL. The composite key is `(report_date, branch_id)`; branch IDs must resolve to staged branches.
+The Load Stage receives `pg_temp.transformed_daily_branch_summary` in the active connection. Every column is NOT NULL, and the composite primary key `(report_date, branch_id)` is enforced by the temporary table itself. Branch IDs resolve to staged branches. The table has no surrogate or foreign keys; Load adds the foreign key to `public.branches`.
 
-| Output column | Type | Source-to-target mapping |
-| --- | --- | --- |
-| report_date | DATE | Union of eligible order, payment, and expense business dates |
-| branch_id | UUID | Branch key from each independent aggregate |
-| order_count | BIGINT | Count of B-04 eligible orders, otherwise 0 |
-| released_order_count | BIGINT | B-04 count of eligible released orders, otherwise 0 |
-| unique_customer_count | BIGINT | B-04 distinct customer IDs per group, otherwise 0 |
-| total_weight_kg | NUMERIC(14,2) | Rounded B-04 sum of weight_kg, otherwise 0 |
-| order_value_php | NUMERIC(14,2) | Rounded B-04 sum of total_price, otherwise 0 |
-| payment_count | BIGINT | Count of B-05 payments, otherwise 0 |
-| cash_received_php | NUMERIC(14,2) | Rounded B-05 sum of amount, otherwise 0 |
-| expense_total_php | NUMERIC(14,2) | Rounded B-06 sum of amount, otherwise 0 |
+| Source column | Source type | Output column | Output type | Transformation applied |
+| --- | --- | --- | --- | --- |
+| `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | TIMESTAMPTZ, TIMESTAMPTZ, DATE | `report_date` | DATE | Asia/Manila business date (S-01, S-02); union of the stream keys (B-07) |
+| `orders.branch_id`, `payments.branch_id`, `expenses.branch_id` | UUID | `branch_id` | UUID | Preserved; key of each independent aggregate (B-04 to B-07) |
+| `orders.id` | UUID | `order_count` | BIGINT | Count of eligible orders (B-04); 0 when none |
+| `orders.status` | TEXT | `released_order_count` | BIGINT | Count of eligible orders mapped to `released` (S-03, B-04); 0 when none |
+| `orders.customer_id` | UUID | `unique_customer_count` | BIGINT | Distinct customers per date and branch (B-04); 0 when none |
+| `orders.weight_kg` | NUMERIC | `total_weight_kg` | NUMERIC(14,2) | Sum, rounded once per group (B-04, S-05); 0 when none |
+| `orders.total_price` | NUMERIC | `order_value_php` | NUMERIC(14,2) | Sum, rounded once per group (B-04, S-05); 0 when none |
+| `payments.id` | UUID | `payment_count` | BIGINT | Count of payments (B-05); 0 when none |
+| `payments.amount` | NUMERIC | `cash_received_php` | NUMERIC(14,2) | Sum, rounded once per group (B-05, S-05); 0 when none |
+| `expenses.amount` | NUMERIC | `expense_total_php` | NUMERIC(14,2) | Sum of non-deleted expenses, rounded once per group (B-03, B-06, S-05); 0 when none |
 
 Use lowercase snake_case for tables and columns. The `transformed_` prefix identifies temporary Stage 2 output, while `analytics.daily_branch_summary` is the permanent destination owned by Load. Retain branch_id as the UUID key; do not introduce a branch surrogate key. Validate uniqueness and required values before handover.
 
@@ -211,21 +234,22 @@ Input schema must match the Stage 1 contract. Missing required fields or incompa
 
 Validation must assess transformed data and its contributing staged records. It must not repeat source connectivity or extraction execution checks.
 
-| Check | Target and purpose | Passing criterion | Severity |
-| --- | --- | --- | --- |
-| Row accounting | Each transaction stream; detect unexplained losses | received = rejected + business_excluded + deferred + contributing | Critical |
-| Reference accounting | Branch/customer working rows | received = retained + rejected | Critical |
-| Join cardinality | Fact lookups and aggregate joins | Required lookup matches exactly once; joins do not multiply rows | Critical |
-| Output key coverage | Combined aggregate | Keys equal the union of eligible stream keys; no duplicates | Critical |
-| Required fields and types | Output contract | No NULL required fields; all values conform to Section 6 | Critical |
-| Branch integrity | Output branch_id | Every branch resolves to exactly one staged branch | Critical |
-| Reporting window | report_date | Every date precedes the captured cutoff | Critical |
-| Count reconciliation | Order and payment counts | Per-group counts equal contributing inputs; released and distinct customer counts recompute correctly | Critical |
-| Measure reconciliation | Weight, order value, collections, expenses | Each group equals its exact contributing sum rounded under S-05 | Critical |
-| Count relationships | Order measures | released_order_count and unique_customer_count do not exceed order_count | Critical |
-| Numeric validity | Output measures | Counts and weight are nonnegative; all measures are finite and within range; monetary signs comply with the approved rule version | Critical |
-| Policy review | Status, monetary signs, and branch attribution | No unresolved status mapping, negative-amount policy, or cross-branch decision | Warning; blocks automatic handover |
-| Empty reporting output | Full-history batch | Empty eligible history explicitly reviewed before replacement loading | Warning; blocks automatic handover |
+Each check is recorded under a rule or check ID. Row-level findings in `orders`, `payments`, or `expenses` quarantine only the affected row and count toward the Section 10 rate. Critical failures stop the batch.
+
+| Check name | Target | Purpose | Validation criteria | Severity |
+| --- | --- | --- | --- | --- |
+| Row accounting (`V-ACCOUNTING`) | Every staged table | Detect lost or double-counted rows | For each table, received = rejected + excluded + deferred + contributing | Critical |
+| Identifier uniqueness (C-05) | IDs and `orders.order_number` | Prevent duplicate rows in totals | No duplicate or missing identifier | Critical for branches and customers; row-level for transaction streams |
+| Reference resolution and join cardinality (C-06, B-08) | Branch, customer, and order references | Prevent orphan rows and row multiplication in joins | Every reference matches exactly one staged parent | Row-level |
+| Required dates (C-06) | `created_at`, `paid_at`, `expense_date` | Assign every row to one business date | Date present and finite | Row-level |
+| Numeric validity (C-03, C-04, C-09) | Weights and amounts | Keep invalid values out of totals | Finite values; weight 0 or more; payment amount more than 0 | Row-level |
+| Policy review (S-03, C-07, C-08) | Status codes, cross-branch payments, negative order values and expenses | Hold values that need a business decision | Approved status code; payment branch equals order branch; amount 0 or more | Row-level (warning) |
+| Output key coverage (`V-KEYS`) | Output `(report_date, branch_id)` keys | Detect missing or extra date and branch rows | Output keys equal the union of the eligible stream keys; the output primary key rejects duplicates | Critical |
+| Reporting window, count relationships, and group reconciliation (`V-TOTALS`) | Every output row | Detect wrong dates, impossible counts, and lost values | `report_date` is before the cutoff; released and unique-customer counts do not exceed `order_count`; each group's counts and rounded sums equal its eligible staged rows, recomputed independently of the aggregation | Critical |
+| Required fields and types (S-05) | Output contract | Keep the Section 6 contract | NOT NULL and type constraints of the output table hold; no total overflows NUMERIC(14,2) | Critical |
+| Empty reporting output (`V-EMPTY`) | Whole batch | Avoid replacing published history with nothing | At least one output row | Non-critical (warning); holds the batch for MANUAL REVIEW |
+
+The output checks `V-ACCOUNTING`, `V-KEYS`, and `V-TOTALS` run when no row is quarantined. When rows are quarantined, Stage 2 rebuilds the output from the remaining rows with the same B-rules (Section 10) and recomputes the row accounting. It does not repeat those three checks on the rebuilt output; Load's exact-content and measure checks then confirm that the published rows match it.
 
 Modified retained rows are not an extra term in the row-accounting equation. A row can match several rules but belongs to only one final accounting category.
 
@@ -233,35 +257,45 @@ Aggregate row count is not expected to equal input row count. Reconcile contribu
 
 Compare rounded group sums with the same per-group rounding method. The sum of rounded groups may differ from a rounded grand total; record the difference without hiding a failed group check.
 
-Any schema, dimension, reconciliation, or output-contract failure rejects the batch. Row-level fact issues use the tolerance policy in Section 10. Record expected values, actual values, affected counts, and check outcomes.
+Any schema, dimension, reconciliation, or output-contract failure rejects the batch. Row-level fact issues use the tolerance policy in Section 10. A failed check is recorded as an issue with its rule ID, severity, and reason in `validation_results`; passing checks add no entry. Affected counts per rule are in `rules_applied`, and row counts in `accounting` (Section 8).
 
 ## 8. Transformation Metadata and Log Specification
 
-Store transformation metadata in restricted `etl_ops.transformation_logs`. Keep transformation and extraction run identities distinct and linked. Each table-level entry must identify its grain so aggregate output counts are not confused with contributing source counts.
+Store one row per transformation run in restricted `etl_ops.transformation_logs`, with the columns `run_id`, `parent_run_id`, `ended_at`, and `metadata`. The `metadata` JSONB document holds the fields below. Per-table counts are kept in its `accounting` list, one entry per staged table, so aggregate output counts are not confused with contributing source counts. Transformation and extraction run identities stay distinct and linked.
 
-| Field | Purpose and format |
-| --- | --- |
-| run_id | Transformation UUID |
-| parent_run_id | Extraction pipeline_run_id; references Stage 1 metadata |
-| retry_of_run_id | Previous transformation attempt UUID, nullable |
-| batch_id | Logical batch identifier associated with cutoff and rules |
-| batch_window | Earliest processed business date and exclusive reporting cutoff; NULL lower date for empty input |
-| table_name | Input stream or transformed output name |
-| transformation_started_at, transformation_ended_at | TIMESTAMPTZ execution boundaries |
-| transformation_status | PASS, WARNING, or FAIL |
-| acceptance_status | APPROVED, APPROVED_WITH_QUARANTINE, MANUAL REVIEW, or REJECTED |
-| log_delivery_status | PENDING, SAVED, or FAILED; separate from the data acceptance decision |
-| records_read, records_output | Received and produced row counts at the stated grain |
-| records_rejected | Distinct rejected rows |
-| records_excluded, records_deferred, records_contributing | Exclusive row-accounting totals |
-| records_modified | Distinct changed and retained rows |
-| rules_applied | JSONB rule IDs and affected counts; rule counts may overlap |
-| validation_results | JSONB check outcomes with expected and actual values |
-| error_code, error_message | Sanitized failure category and description |
-| duration_ms | Nonnegative runtime |
-| code_version, rule_version, schema_version | Implementation and contract versions used by the batch |
+| Field | Purpose | Example or format |
+| --- | --- | --- |
+| `run_id` | Unique ID of the transformation run | UUID |
+| `parent_run_id` | Linked extraction `pipeline_run_id`; Stage 1 metadata is referenced, not copied | UUID |
+| `batch_id` | Logical batch: extraction run, cutoff, and batch version | `<extraction run ID>:2026-11-12:1.0.0` |
+| `cutoff` | Exclusive end of the batch window; the window is all staged history before this Asia/Manila date | `2026-11-12` |
+| `started_at`, `ended_at` | Transformation start and end | `2026-11-12T01:19:52.277819+00:00` |
+| `duration_ms` | Transformation runtime | `14` |
+| `status` | Validation outcome | `PASS`, `PARTIAL`, `WARNING`, `FAIL` |
+| `acceptance_status` | Handover decision (Section 10) | `APPROVED`, `APPROVED_WITH_QUARANTINE`, `MANUAL REVIEW`, `REJECTED` |
+| `handover` | Whether Load received the output | `ACKNOWLEDGED`, `NOT_CONFIGURED`, `NOT_ATTEMPTED`, `FAILED` |
+| `log_delivery_status` | Log persistence, separate from the data decision | `PENDING`, `SAVED`, `FAILED` |
+| `accounting` | Per staged table: `table_name`, `records_read`, `records_rejected` (quarantined), `records_excluded`, `records_deferred`, `records_contributing`, and `records_modified` | `{"table_name": "orders", "records_read": 35, "records_rejected": 1, ...}` |
+| `records_output` | Rows in the transformed output | `33` |
+| `quarantined_records` | Distinct quarantined rows across the transaction streams | `1` |
+| `quarantine_rates` | Quarantined rows, received rows, and rate for `orders`, `payments`, and `expenses` | `{"orders": {"quarantined": 1, "received": 35, "rate_percent": 2.9}, ...}` |
+| `quarantine_table`, `quarantine_rate_percent` | The stream with the highest rate, and that rate, which drives acceptance | `orders`, `2.9` |
+| `tolerance` | The limits applied (Section 10) | `{"auto_publish_max_percent": 5, "manual_review_max_percent": 10}` |
+| `rules_applied` | Rows affected per rule and table; counts may overlap | `[{"rule_id": "C-04", "table_name": "orders", "affected_rows": 1}, ...]` |
+| `issues` | Each finding: table, record UUID, rule ID, severity, and reason | `{"table_name": "orders", "rule_id": "C-04", "severity": "FAIL", "reason": "Negative numeric value", ...}` |
+| `validation_results` | Overall validation status and the issue list | `{"status": "PARTIAL", "issues": [...]}` |
+| `error_code`, `error_message` | Failure category and sanitized description when the batch is held or rejected | `QUARANTINE_REVIEW_REQUIRED`, `QUARANTINE_LIMIT_EXCEEDED`, `TRANSFORMATION_FAILED`, or absent |
+| `code_version`, `rule_version`, `schema_version` | Implementation, rule-set, and output-contract versions | `1.0.0`, `1.2.0`, `1.0.0` |
 
-Use metadata for monitoring, rule impact analysis, lineage, troubleshooting, and comparison of corrected reruns. Do not duplicate all extraction metadata or store credentials in diagnostics.
+Every run records `rule_version` `1.2.0`. The quarantine counts, rates, and `tolerance` are recorded when the Section 10 policy evaluates the batch, including clean runs (0 quarantined, 0% per stream). A batch with no output left after quarantining records `quarantined_records` only. A batch stopped by a schema, dimension, reconciliation, or empty-output check records `tolerance` with its issues and status, but no quarantine counts.
+
+- **Monitoring:** Track the daily decision, duration, output rows, and quarantine rate per stream.
+- **Troubleshooting:** The `issues` list names the rule, table, record, and reason; `error_code` explains a hold or rejection.
+- **Auditing:** `rules_applied` and `rule_version` show which rules changed, excluded, or quarantined how many rows in each run.
+- **Lineage:** `parent_run_id` links to the extraction log. Load stores this `run_id` as `transformation_run_id`, and the quarantine evidence and fix list reference it.
+- **Recovery:** A held or rejected run is never resumed. After the source records are corrected, for example with `python -m pipeline.quarantine --fix`, a new run starts from extraction, and its `accounting` can be compared with the failed run.
+
+Do not duplicate all extraction metadata or store credentials in diagnostics.
 
 Failure evidence must survive rollback. The orchestration layer must capture diagnostics before ending the processing transaction and persist them through a separate authorized logging transaction afterward. Permanent writes must not be attempted inside the existing read-only extraction transaction.
 
@@ -276,12 +310,26 @@ Transformation logs and rejection evidence must be retained for at least one yea
 | Record | Storage | Contents and ownership |
 | --- | --- | --- |
 | Transformation logs | etl_ops.transformation_logs | Counts, rule actions, validation outcomes, decisions, and lineage; owned by authorized ETL operations role |
-| Quarantine evidence | etl_ops.transformation_quarantine | Batch/run IDs, staged table, record UUID, rule IDs, severity, reason, and minimal offending values; owned by authorized ETL operations role |
+| Quarantine evidence | etl_ops.transformation_quarantine | One row per finding: the transformation `run_id`, which links to the batch ID in the log, plus the staged table, record UUID, rule ID, severity, and reason. Offending values are not copied; the fix list reads the current values from the source. Owned by authorized ETL operations role |
+| Quarantine fix list | etl_ops.quarantine_review (view) | Records quarantined by the latest run, with their current source values, the rules they broke, how to fix them, and how many runs have quarantined them |
+| Quarantine fix log | etl_ops.quarantine_fixes | One row per source field changed through the fix command: who and when, table, record UUID, rules, field, old and new values, and the run that quarantined the record; owned by authorized ETL operations role |
 | Pending metadata | Restricted orchestration pending store | Undelivered diagnostic metadata; retained until durable delivery is confirmed |
 
 Quarantine must contain only the fields needed to diagnose a failed transformation. Do not copy complete customer records or unnecessary sensitive data. Business-excluded and deferred records are not quarantined as invalid records; record their counts and reasons separately.
 
-Quarantine is not a substitute for extraction staging. After correction, rerun extraction and transformation against a new approved snapshot. Retain rejection evidence even when the failed processing transaction rolls back through the logging arrangement in Section 8.
+Quarantine is not a substitute for extraction staging. After correction, rerun extraction and transformation against a new approved snapshot.
+
+Fix a quarantined record in its source table, for example in the Supabase Table Editor, not in the quarantine evidence. The pipeline reads the full source history on every run, so a corrected copy would be quarantined again and the application would keep the wrong value. `python -m pipeline.quarantine` lists the records quarantined by the latest run with their current values, the rule they broke, and how to fix them; `python -m pipeline.quarantine --export` also saves the list as CSV in `quarantine/`.
+
+`python -m pipeline.quarantine --fix` corrects the records from the terminal, one record at a time:
+
+- It changes only the source fields that the record's rules flagged, and only those that still break a rule.
+- Each new value is checked against the same rule before it is accepted. Weight and order value must be 0 or more, a payment amount must be more than 0, a status must be an approved status, and a payment's branch must be its order's branch.
+- Nothing is saved until the operator confirms. The record's changes and their fix-log rows are written in one transaction.
+- A change is refused when the field no longer holds the value that was shown, so a newer edit made in the application is not overwritten.
+- Rules that need more than a field correction, such as removing a duplicate (C-05), are left to the Supabase Table Editor.
+
+The next run checks each record again, and a corrected record leaves the list. Retain rejection evidence even when the failed processing transaction rolls back through the logging arrangement in Section 8.
 
 The runtime may write through authorized logging paths. Approved operators and administrators may read. Only authorized administrators may archive or delete. Enforce restricted database privileges and appropriate row-level policies before deployment.
 
@@ -291,24 +339,52 @@ Before deletion, an administrator must confirm that the retention period has ela
 
 ## 10. Transformation Acceptance and Handover Rules
 
-The row-level quarantine tolerance is **100%** for independently attributable fact rows in `orders`, `payments`, and `expenses`. A quarantined row never contributes to analytics. The output and metadata must explicitly record the quarantined count and rule evidence, so the system does not silently omit it. Business exclusions and date-window deferrals are not quarantines.
+Stage 2 decides on its own whether a batch with quarantined rows is still usable. For each transaction stream (`orders`, `payments`, and `expenses`), the quarantine rate is the number of distinct quarantined rows divided by the rows received in that stream. The stream with the highest rate decides:
 
-Schema, extraction-contract, branch/customer dimension, aggregate reconciliation, and output-contract failures have **0% tolerance** because they can make unrelated analytics unreliable. Calculate the quarantine rate from distinct quarantined fact rows divided by received transaction rows. For an empty denominator, record the rate as not applicable and apply the empty-output review rule.
+| Highest stream quarantine rate | Decision |
+| --- | --- |
+| 5% or less | APPROVED_WITH_QUARANTINE: the valid rows are offered to Load |
+| More than 5%, up to 10% | MANUAL REVIEW: the output is held and not offered |
+| More than 10% | REJECTED: the output is not usable |
+
+A quarantined row never contributes to analytics, so daily totals are understated by about the quarantine rate, and defects usually concentrate in one branch or day. Up to 5%, the published totals stay close and the quarantined count is reported. Between 5% and 10%, a person must decide whether the totals are still acceptable. Above 10%, branch comparisons and trends become misleading. Each stream is measured on its own so that a badly affected smaller stream, such as expenses, is not hidden by a large clean one. These limits are part of rule version `1.2.0`, which every Stage 2 run records with the tolerance it applied. A clean run records 0 quarantined rows and a 0% rate for each stream.
+
+The output and metadata must explicitly record the quarantined count, the rate of each stream, and the rule evidence, so the system does not silently omit a row. Business exclusions and date-window deferrals are not quarantines and do not count toward the rate.
+
+Schema, extraction-contract, branch/customer dimension, aggregate reconciliation, and output-contract failures have **0% tolerance** because they can make unrelated analytics unreliable. For an empty stream, record its rate as not applicable; an empty output follows the empty-output review rule.
 
 | Validation condition | Acceptance | Pipeline action | Decision and responsibility |
 | --- | --- | --- | --- |
 | All critical checks pass; zero quarantined rows; no unresolved warnings; required validation and handover metadata captured | APPROVED | Offer validated output to Load; finalize persistent logging after the transaction ends | Automatic |
-| Only independently attributable fact rows are quarantined and at least one valid output group remains | APPROVED_WITH_QUARANTINE | Offer the partial output; preserve quarantine evidence and counts | Automatic; operator reviews evidence separately |
-| No critical failure, but an empty-output warning remains | MANUAL REVIEW | Hold handover; preserve evidence | ETL operator and data owner review |
-| Any schema, dimension, reconciliation, output-contract, or operational failure; or no valid output remains after quarantining | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
+| Only independently attributable fact rows are quarantined, at least one valid output group remains, and the highest stream quarantine rate is 5% or less | APPROVED_WITH_QUARANTINE | Offer the partial output; preserve quarantine evidence and counts | Automatic; operator fixes the listed records separately |
+| No critical failure, but an empty-output warning remains; or the highest stream quarantine rate is more than 5% and up to 10% | MANUAL REVIEW | Hold handover; discard the temporary output; preserve evidence and the fix list | ETL operator and data owner review; fix the records and run again |
+| Any schema, dimension, reconciliation, output-contract, or operational failure; no valid output remains after quarantining; or the highest stream quarantine rate is more than 10% | REJECTED | Stop handover and discard incomplete output | Automatic stop; operator resolves the cause |
 
-`APPROVED_WITH_QUARANTINE` does not repair source data. Operators must correct quarantined records and review later runs. Manual review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution.
+Example validation summary for a batch with 3 of 35 orders quarantined:
 
-Retry transient operational failures with a new attempt and linked run IDs. Do not automatically retry unresolved business or validation failures.
+| Validation summary | Result |
+| --- | --- |
+| `branches` and `customers` references | PASS |
+| `orders` transformation | WARNING (3 of 35 quarantined, 8.6%) |
+| `payments` transformation | PASS (0 of 34 quarantined) |
+| `expenses` transformation | PASS (0 of 33 quarantined) |
+| **Overall transformation** | **MANUAL REVIEW** (`QUARANTINE_REVIEW_REQUIRED`) |
 
-Handover must include the temporary output reference, transformation run ID, parent extraction run ID and its run-start timestamp (`extraction_started_at`, passed through unchanged), batch window and cutoff, schema/rule/code versions, output count, rejection/exclusion/contribution counts, validation results, errors, and acceptance status. Load must acknowledge the run ID and approved decision while the output is available in the active connection.
+`APPROVED_WITH_QUARANTINE` does not repair source data. Operators must correct quarantined records and review later runs. Manual review does not override failed reconciliation or convert an unsupported value into valid data. Temporary output cannot remain available after the connection closes; held batches require a fresh approved extraction after resolution. In scheduled runs, a batch held for MANUAL REVIEW or REJECTED marks the Cron job as failed so the operator is alerted.
 
-Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone must not be recorded as successful publication. Load owns permanent writes and publication acceptance; integration must resolve the transaction dependency identified in Section 1.
+Stage 2 does not retry within a run. A database error during transformation rejects the run with `TRANSFORMATION_FAILED`. The next scheduled run, or a manual rerun, starts again from extraction with new run IDs. Business and validation failures are never retried automatically; they are corrected at the source first.
+
+Handover includes:
+
+- The temporary output reference (`pg_temp.transformed_daily_branch_summary`)
+- The transformation run ID, and the parent extraction run ID with its run-start timestamp (`extraction_started_at`, passed through unchanged)
+- The batch ID and cutoff. The handover builds the batch window from these ([Load Stage, Section 1](../Load/Load.md#load-input)).
+- Schema, rule, and code versions
+- The output count, the row-accounting and quarantine counts, validation results, errors, and the acceptance status
+
+Load acknowledges the run ID and approved decision while the output is available in the active connection.
+
+Record NOT_CONFIGURED when no Load receiver exists. Successful transformation alone is never recorded as successful publication. Load owns permanent writes and publication acceptance, in its own publication transaction (Section 1).
 
 Persistent log-delivery failure is an operational failure recorded separately under Section 8. It does not retroactively change calculated validation results or authorize replay of a completed Load operation. Recover undelivered logs before treating the run as operationally complete.
 
@@ -320,13 +396,18 @@ Persistent log-delivery failure is an operational failure recorded separately un
 | Inflated measures | Raw orders, payments, and expenses joined before grouping | Duplicated order value, collections, or expenses | Aggregate streams independently; verify join cardinality and group totals |
 | Wrong business date | UTC calendar date used directly or cutoff recalculated mid-run | Activity assigned to incorrect days | Apply Manila conversion and one captured cutoff; preserve expense DATE |
 | Missing historical changes | Only recent orders processed | Late payments or corrections absent from summaries | Rebuild completed-day history from full staged input |
-| Unknown status | Application introduces a code absent from approved mapping | Unclear eligibility or released-order counts | Hold batch, review observed values, version mapping, and rerun |
-| Negative amount or cross-branch collection | Refund/adjustment or collection practice not defined | Ambiguous financial attribution | Hold for owner review; establish explicit policy without guessing repairs |
+| Unknown status | Application introduces a code absent from approved mapping | Unclear eligibility or released-order counts | Quarantine the affected orders (S-03); if the code is legitimate, version the mapping and rerun; the Section 10 rate holds the batch if the code is widespread |
+| Negative amount or cross-branch collection | Refund/adjustment or collection practice not defined | Ambiguous financial attribution | Quarantine the rows (C-07, C-08) for owner review; correct them with `python -m pipeline.quarantine --fix` or approve an explicit policy, never guessing repairs |
 | Overflow or rounding discrepancy | Large totals or per-row rounding | Invalid target values or reconciliation failure | Sum exact NUMERIC values, round once per group, and validate target range |
 | Different results on rerun | Source corrections, changed statuses, or changed rules | Historical metrics change | Compare extraction run IDs, cutoff, and rule versions; verify identical-input determinism |
 | Empty completed-day output | No eligible history or unintended exclusions | Full-replacement loading could clear reports | Hold for review; verify exclusion counts and cutoff before approval |
+| Widespread defects | Many source records break the cleaning rules | Published totals would understate activity and mislead branch comparisons | Hold above 5% and reject above 10% per stream (Section 10); fix the listed records with `python -m pipeline.quarantine --fix` and run again |
 | Missing failure diagnostics | Connection ends before durable logging | Batch cannot be fully traced | Use pending metadata and replay; report incomplete evidence and inspect scheduler history |
 | Full-history processing slows | Source history grows | Transformation delays the daily pipeline | Monitor duration and contributing counts; review SQL plans and reassess batch design with reconciliation tests |
-| Permanent publication blocked | Existing extraction transaction is read-only | Load cannot write the target | Resolve orchestration transaction and role privileges before integrating Load; keep Stage 2 output temporary |
+| Permanent publication blocked | Load writes the target inside the read-only extraction transaction | `cannot execute INSERT in a read-only transaction`; nothing published | Keep Stage 2 output temporary; Load copies it during the snapshot and publishes in a separate read-write transaction in the same session ([Load Stage, Section 1](../Load/Load.md#transaction-design)) |
 
 Transformation must stop handover when mitigation requires a change to business rules, input contracts, or transaction design. Record the cause and applied correction, then validate a new batch before publication.
+
+## Expected Output
+
+One temporary table, `pg_temp.transformed_daily_branch_summary`, holds one validated row per completed business date and branch, following the Section 6 contract. It is handed to Load in the same session with its run metadata, quarantine counts and rates, validation results, and acceptance decision. Every input row is accounted for as contributing, excluded, deferred, or quarantined. Quarantined rows are logged with their rule and reason and listed for correction. Source and staged records are never changed, and no permanent reporting table is written in this stage.

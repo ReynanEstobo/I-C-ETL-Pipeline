@@ -14,17 +14,22 @@ I&C Laundry uses a shared operational system for its Main, Calzada, and Nasugbu 
 
 ### Extraction method and tools
 
-Extraction must read full history on each run, with no incremental cursor. SQL must copy the selected source columns into separate temporary staging tables inside the same PostgreSQL database.
+Extraction is a **full extraction**: every run reads the complete history, so no incremental field or cursor defines the window. SQL copies the selected source columns into separate temporary staging tables inside the same PostgreSQL database.
 
-Python will wrap the SQL extractor using `psycopg`. The wrapper will manage the connection and transaction, execute SQL, and display counts and validation results. Extracted records must remain in PostgreSQL rather than being downloaded into Python memory.
+- **Scheduled runs:** the SQL procedure `etl_ops.run_scheduled_extraction()` performs the extraction inside PostgreSQL.
+- **Manual runs:** Python wraps the same extraction using `psycopg`. It manages the connection and transaction, runs the SQL, and displays counts and validation results. Extracted records stay in PostgreSQL rather than being downloaded into Python memory.
+  - `python -m pipeline.extraction` runs a standalone extraction check.
+  - `python -m pipeline.extraction --flush-logs` delivers queued log metadata.
+  - `python -m pipeline.extraction --setup-logs` creates the log tables.
+  - `python -m pipeline.load` runs extraction together with Stages 2 and 3.
 
 Empty temporary tables are created in a setup transaction. Source reads, staging inserts, and validation then run in one read-only `REPEATABLE READ` transaction. Only temporary staging tables receive extracted records; source tables remain unchanged.
 
 ### Schedule
 
-Extraction must run daily at **01:00 Asia/Manila**, using `0 17 * * *` when the scheduler uses UTC. Supabase Cron / `pg_cron` will schedule the extraction SQL inside PostgreSQL. Python will wrap the SQL for manual execution and testing.
+Extraction runs daily at **01:00 Asia/Manila**, using `0 17 * * *` because the scheduler uses UTC. The Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction` runs `CALL etl_ops.run_scheduled_pipeline();`. That procedure calls `etl_ops.run_scheduled_extraction()`, which hands the approved snapshot to Stages 2 and 3 in the same session.
 
-Manual and scheduled runs must follow the same extraction scope, snapshot requirements, and validation rules.
+Manual and scheduled runs follow the same extraction scope, snapshot requirements, and validation rules.
 
 ### Extraction scope
 
@@ -34,7 +39,7 @@ Do not filter, clean, standardize, or calculate business values during extractio
 
 ### Limitations and assumptions
 
-- The account needs SELECT access to the required source columns and permission to create temporary tables.
+- The account needs SELECT access to the required source columns and permission to create temporary tables. Manual and scheduled runs use the project's `postgres` account, which owns the source tables and bypasses row-level security, so it reads every source row. A least-privilege pipeline role is planned ([Load Stage, Section 1](../Load/Load.md#limitations-and-assumptions)).
 - Required source columns and types must match Section 2. Unexpected changes stop extraction.
 - Nullable dates and references are retained and reported. Warnings are handed to Stage 2 as `APPROVED_WITH_WARNINGS`, where the affected fact row is quarantined if it cannot safely contribute to analytics.
 - Full-history extraction includes late payments and historical corrections on subsequent runs, but its volume grows over time.
@@ -68,6 +73,7 @@ SQL must check the staged records inside PostgreSQL. During manual runs, Python 
 | Date availability and validity | `orders.created_at`, `payments.paid_at`, `expenses.expense_date` | Confirm dates are available for the next stage. | PASS: dates are present and finite. WARNING: nullable `orders.created_at` is NULL. FAIL: a required date is NULL or a date is infinite. PostgreSQL column types reject malformed dates. |
 | Record-count completeness | Source and staged counts for each table | Detect missing or additional staged rows. | PASS: counts match within the same snapshot. FAIL: counts differ. Empty sources with empty stages pass. |
 | Snapshot consistency | All source reads | Prevent mixed source versions. | PASS: reads and checks use one read-only `REPEATABLE READ` transaction. FAIL: required transaction settings are not active. |
+| Overlap lock | Extraction advisory lock | Prevent two extractions from reading full history at the same time. | PASS: the transaction-scoped advisory lock is acquired. FAIL: another extraction holds it, so no source records are read (`EXTRACTION_ALREADY_RUNNING`). |
 | Completion | Entire extraction run | Prevent partial handover. | PASS: all staging and checks finish. FAIL: a query, connection, or staging operation fails. |
 
 Record per-check, per-table, and overall results. A table fails if any of its checks fail, otherwise it receives WARNING if any check warns, or PASS. The overall result follows the same precedence. Checks must not change the extracted data.
@@ -86,14 +92,20 @@ Record per-check, per-table, and overall results. A table fails if any of its ch
 | `records_rejected` | Counts individually excluded rows, if applicable. | `0`; records are not filtered during extraction |
 | `extraction_window` | Defines the source history read. | `All available history` |
 | `validation_results` | Stores check and table outcomes with affected counts. | JSONB |
-| `error_code` | Identifies the failure category. | `SOURCE_CONNECTION_FAILED`, `SCHEMA_MISMATCH`, or NULL |
+| `error_code` | Identifies the failure category. | `SOURCE_CONNECTION_FAILED`, `EXTRACTION_ALREADY_RUNNING`, `VALIDATION_FAILED`, `HANDOVER_FAILED`, `EXTRACTION_FAILED`, or NULL |
 | `error_message` | Describes the failure without credentials. | TEXT or NULL |
 | `duration_ms` | Measures extraction runtime. | Non-negative integer |
-| `acceptance_status` | Records the handover decision separately from validation. | `APPROVED`, `APPROVED_WITH_WARNINGS`, `MANUAL REVIEW`, `REJECTED` |
+| `acceptance_status` | Records the handover decision separately from validation. | `APPROVED`, `APPROVED_WITH_WARNINGS`, `REJECTED` |
 
-Capture one run-start timestamp for the source snapshot and link table logs using the run ID. Retries receive new run IDs. Logs support monitoring, troubleshooting, auditing, and recovery; unavailable counts must not be reported as zero.
+Capture one run-start timestamp for the source snapshot and link table logs using the run ID. Each run writes one log row per source table. Retries receive new run IDs. Unavailable counts must not be reported as zero.
 
-Store logs in a restricted ETL operations table in the same PostgreSQL database, separate from `public` source records. During manual runs, Python must display staged counts and validation results. Failure logs must survive rollback of the extraction transaction. A separate logging transaction must store only run metadata, validation results, and error details; it must not extract or process source records. If the database is unavailable, record the failure once connectivity is restored, using the original run ID and timestamps.
+- **Monitoring:** Track daily status, duration, and source and staged counts per table across runs.
+- **Troubleshooting:** Read the failed or warning checks and their affected-row counts in `validation_results`, with the sanitized error.
+- **Auditing:** Show which source history each run read, when, and with which decision.
+- **Lineage:** Stage 2 records the extraction `pipeline_run_id` as its `parent_run_id`, and Load records it as `extraction_run_id`.
+- **Recovery:** Find failed or interrupted runs, confirm that no handover occurred, and rerun with a new run ID.
+
+Store logs in the restricted `etl_ops.extraction_logs` table in the same PostgreSQL database, separate from `public` source records. During manual runs, Python must display staged counts and validation results. Failure logs must survive rollback of the extraction transaction. A separate logging transaction must store only run metadata, validation results, and error details; it must not extract or process source records. If the database is unavailable, record the failure once connectivity is restored, using the original run ID and timestamps.
 
 The Python wrapper must keep undelivered log metadata in a private local `.pending-extraction-logs` directory so it survives restarts. This queue must contain no credentials or extracted source records and must be excluded from Git. Replay pending entries before the next extraction, or with `python -m pipeline.extraction --flush-logs`. Keep original run IDs and timestamps, prevent duplicate database entries, and remove a queued entry only after its database transaction commits. The queue is temporary metadata storage, not an extraction staging store.
 
@@ -164,9 +176,22 @@ Check required columns and types before copying records. Stop if a required fiel
 | --- | --- | --- | --- |
 | All checks pass | All five datasets are complete, with no failed checks or warnings. | Mark `APPROVED`; allow the next stage to use staging in the same transaction. | Automatic. |
 | Non-critical warnings | Extraction is complete, but nullable dates or references need review. | Mark `APPROVED_WITH_WARNINGS`; hand staging and warning evidence to the tolerant Stage 2 consumer. Stage 2 quarantines any affected unsafe fact row and records its decision. | Automatic handover; ETL operator or data owner reviews the evidence. |
-| Critical failure | Required source access, schema, identifiers, references, dates, counts, or completion checks fail. | Mark `REJECTED`; stop handover and roll back staging. Retain failure logs. Retry temporary failures with a new run ID. | Automatic stop; ETL operator or database administrator resolves the failure. |
+| Critical failure | Required source access, schema, identifiers, references, dates, counts, overlap lock, or completion checks fail. | Mark `REJECTED`; stop handover and roll back staging. Retain failure logs. Retry temporary failures as described below. | Automatic stop; ETL operator or database administrator resolves the failure. |
 
-Warnings do not repair source data. Operators must review and correct them even when Stage 2 safely quarantines their affected rows. Critical failures must be resolved before handover.
+**Manual review:** No extraction condition holds the pipeline for approval. Warnings are reviewed after the run: the ETL operator checks the warning evidence in `etl_ops.extraction_logs` and the Stage 2 quarantine list, and corrects the source records. Warnings do not repair source data, so operators must correct them even when Stage 2 safely quarantines the affected rows.
+
+**Rejection and retries:** Critical failures must be resolved before handover; data problems are never retried. Temporary database errors are retried up to 3 attempts in total, waiting 2 seconds and then 4 seconds, and each attempt receives a new run ID. These are connection failures (`08xxx`), serialization failure (`40001`), deadlock (`40P01`), too many connections (`53300`), and server shutdown (`57P01` to `57P03`). Scheduled runs and the standalone `python -m pipeline.extraction` check retry this way. In a manual full run (`python -m pipeline.load`), a temporary failure stops the run, and the operator runs it again. The scheduled job is marked as failed in `cron.job_run_details` when extraction is rejected.
+
+Example validation summary for a run with one order missing its creation date:
+
+| Validation summary | Result |
+| --- | --- |
+| `public.branches` extraction | PASS |
+| `public.customers` extraction | PASS |
+| `public.orders` extraction | WARNING (`created_at_present`: 1 row) |
+| `public.payments` extraction | PASS |
+| `public.expenses` extraction | PASS |
+| **Overall extraction** | **APPROVED_WITH_WARNINGS** |
 
 ### Handover
 
@@ -192,4 +217,4 @@ Scheduled handover uses an optional receiver configured by the database administ
 
 ## Expected Output
 
-Five raw, validated datasets in PostgreSQL temporary staging at their original row grain, with run metadata, validation results, and an acceptance decision for handover within the same transaction. Source records must remain unchanged, and persistent logs must remain available after staging is removed. Python will wrap the extraction SQL without moving source records out of PostgreSQL.
+Five raw, validated datasets in PostgreSQL temporary staging at their original row grain, with run metadata, validation results, and an acceptance decision for handover within the same transaction. Source records must remain unchanged, and persistent logs must remain available after staging is removed. Python wraps the extraction SQL for manual runs without moving source records out of PostgreSQL.
