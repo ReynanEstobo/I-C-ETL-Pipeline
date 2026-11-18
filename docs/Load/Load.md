@@ -25,22 +25,22 @@ Load receives `pg_temp.transformed_daily_branch_summary`, defined in the [Transf
 
 The batch window runs from its start date up to, but excluding, the reporting cutoff. The cutoff is the Asia/Manila calendar date on which the extraction run started. Stage 2 sends the cutoff as `cutoff` but sends no `batch_window`, so the Stage 2-to-Load handover builds one: `start` is the earliest `report_date` in the transformed output, and `cutoff` is the Asia/Manila date of `extraction_started_at`. A `batch_window` sent by Stage 2 is passed through unchanged. A date inside the window with no eligible activity has no output row. Load reads the window as text such as `2026-10-12 to 2026-11-12`, a date range such as `[2026-10-12,2026-11-12)`, or a structured value with start and cutoff dates. For example, a run starting at 2026-11-12 01:00 Asia/Manila has cutoff 2026-11-12 and publishes dates up to 2026-11-11.
 
-Load must use only the handed-over rows. It must not read `public` source tables or `pg_temp.stage_*` tables to calculate or replace values, and it must not recalculate measures. The only reads outside the received batch are target-side checks: the published target, the publication records and removal approvals in `etl_ops`, and the branch foreign key.
+Load must use only the handed-over rows. It must not read `public` source tables or `pg_temp.stage_*` tables to calculate or replace values, and it must not recalculate measures. The only reads outside the received batch are target-side checks: the published target, the publication records and removal approvals in `etl_ops`, and the branch foreign key. The CSV export of a manual run (Section 8) also reads the branch labels from `public.branches.branch_name`, after publication.
 
 ### Target system
 
 | Item | Specification |
 | --- | --- |
 | Target | `analytics.daily_branch_summary`, the permanent daily branch reporting table. |
-| Purpose | Reusable completed-day measures for sales monitoring, payment collections, expenses, laundry demand, branch comparison, and customer activity. |
+| Purpose | Reusable completed-day measures for sales monitoring, payment collections, expenses, laundry demand, branch comparison, and customer activity, and the history used as input for forecasting. |
 | Database management system | PostgreSQL in the existing Supabase project, the same database that holds the operational records. |
 | Target schema | `analytics` for reporting data. Load metadata is stored in the restricted `etl_ops` schema. |
-| Consumers | The application's authorized reporting layer, with SELECT access only. |
+| Consumers | The analytics and decision-support side of the application: owner and branch-manager dashboards, reports, and forecasting inputs, read through an authorized reporting layer with SELECT access only. The staff screens for orders, payments, and laundry status keep using the operational `public` tables. The application integration is not built yet: today only the pipeline account can read the table, so the results are viewed in the Supabase Table Editor (`analytics` schema) and in the CSV file of a manual run (Section 8). |
 
 ### Load method
 
 - **Tools:** SQL inside PostgreSQL writes the target. Python wraps the load for manual runs using `psycopg`. Records must stay in PostgreSQL rather than being downloaded into Python memory.
-  - `python -m pipeline.load` runs extraction, transformation, and load on one connection and prints a short summary (Section 8). `--verbose` also prints every detail as it happens. Each run's full output is saved in `logs/etl-run-<date>-<time>.log`.
+  - `python -m pipeline.load` runs extraction, transformation, and load on one connection and prints a short summary (Section 8). `--verbose` also prints every detail as it happens. Each run's full output is saved in `logs/etl-run-<date>-<time>.log`. When the batch is published, the run also saves the published rows as a CSV file in `exports/daily_branch_summary-<date>-<time>.csv` (Section 8).
   - `python -m pipeline.load --flush-logs` delivers queued load metadata.
 - **Schedule:** Daily at **01:00 Asia/Manila** (`0 17 * * *` when the scheduler uses UTC), immediately after approved transformation in the same run. Load has no separate Cron job, because its input exists only in the run's session. The Supabase Cron / `pg_cron` job `ic_laundry_daily_extraction` runs `CALL etl_ops.run_scheduled_pipeline();`, which runs `etl_ops.run_scheduled_extraction()` and then publishes in the same session.
 - **Write method:** Set-based bulk SQL from the received temporary table: one `INSERT ... ON CONFLICT (report_date, branch_id) DO UPDATE` statement, plus a `DELETE` limited to approved absent keys (Section 3). Rows are not inserted one at a time, and `TRUNCATE` is not used.
@@ -63,13 +63,13 @@ In scheduled runs, `etl_ops.consume_transformation_with_load(jsonb)` is the cons
 ### Load scope
 
 - **Tables and order:** One target table, `analytics.daily_branch_summary`. No dimension tables are loaded: `public.branches` is the existing branch reference, maintained by the application. The order is receipt, pre-load checks, target write and publication record, post-load checks, `COMMIT`, then logging.
-- **Expected volume:** One row per completed business date and branch with eligible activity: at most 3 × the number of completed dates, or about 1,095 rows for each year of history. The profiled Stage 2 batch covered two business dates, so at most 6 rows.
+- **Expected volume:** One row per completed business date and branch with eligible activity. The source holds five active branch records today, so a batch has at most 5 × the number of completed dates, about 1,825 rows for each year of history. The current batch publishes 33 rows covering 27 dates (2026-10-05 to 2026-10-31) across the 5 branches; dates without activity have no row.
 - **Time window:** The publication transaction uses `SET LOCAL lock_timeout = '5s'`. Manual runs also use `SET LOCAL statement_timeout = '60s'`; scheduled runs do not, because the whole Cron procedure runs as one statement. The whole run, including retries, must finish before 02:00 Asia/Manila, well before branches open.
 
 ### Limitations and assumptions
 
 - The received batch exists only in the run's session. If the connection closes before publication, the batch cannot be published; the previous publication remains, and a new run must start from extraction.
-- Each run replaces the complete completed-day history. The workload grows with history, roughly 1,000 rows per year, which is small for PostgreSQL. Reassess before history spans many years or more branches are added.
+- Each run replaces the complete completed-day history. The workload grows with history, at most about 1,825 rows per year with today's five branch records, which is small for PostgreSQL. Reassess before history spans many years or more branches are added.
 - Released orders are grouped by creation date (Stage 2, B-04). A later status change can revise an earlier published date. This is an expected update, not an error.
 - `unique_customer_count` is distinct within one date and branch. Adding it across dates or branches overcounts customers, so reports must not sum it.
 - **Pipeline account:** Load runs in the same session as extraction and transformation, so one database account runs the whole pipeline. Manual runs connect as the project's `postgres` account, and the Cron job `ic_laundry_daily_extraction` runs as `postgres`, the account that scheduled it.
@@ -113,7 +113,7 @@ In scheduled runs, `etl_ops.consume_transformation_with_load(jsonb)` is the cons
 
 The ten measure and key columns match the Stage 2 output contract exactly in name and type. Load adds only `reporting_cutoff`, `load_run_id`, and `refreshed_at`. Measure columns have no default values, so a missing value fails the insert instead of silently becoming zero. The table has no SCD Type 2 history columns, because aggregates are overwritten (Section 3).
 
-**Indexes and partitions:** The primary-key B-tree index on `(report_date, branch_id)` serves the match key and date-range queries. A secondary index on `(branch_id, report_date)` supports per-branch trends and foreign-key checks when a branch row changes. The table is not partitioned: it grows by about 1,100 rows per year.
+**Indexes and partitions:** The primary-key B-tree index on `(report_date, branch_id)` serves the match key and date-range queries. A secondary index on `(branch_id, report_date)` supports per-branch trends and foreign-key checks when a branch row changes. The table is not partitioned: it grows by at most about 1,825 rows per year.
 
 ### Publication control table
 
@@ -315,6 +315,7 @@ The publication record in `etl_ops.load_publications` commits with the target, s
 | Removal approvals | `etl_ops.load_review_approvals` | At least one year after use | Approved keys, reason, approving role, approval time, and the `load_run_id` that applied it |
 | Pending metadata | Private local pending directory; `etl_ops.pending_load_logs` | Until delivery is confirmed | Undelivered load metadata only |
 | Published data | `analytics.daily_branch_summary` | Current publication only | Previous values of revised keys are kept in `revisions` |
+| CSV exports | `exports/` folder on the computer that ran the manual run; excluded from Git | Kept until the operator removes them | The rows one manual run published, with branch names; aggregated measures only, no customer records |
 
 Stage 1 and Stage 2 logs use the same one-year retention period. It is long enough to investigate historical report changes, failed batches, and approved removals. Longer organizational audit requirements take precedence, and approval and maintenance records follow that audit period separately from operational logs.
 
@@ -323,7 +324,7 @@ Stage 1 and Stage 2 logs use the same one-year retention period. It is long enou
 | Pipeline account (`postgres` today; `ic_etl_runtime` once created) | Target, publication records, load logs, approvals, and the Stage 1 and Stage 2 objects listed in Section 1 | Target rows; inserts into publication records, load logs, pending logs, and rejections; marks approvals as applied | Delivered pending entries only |
 | ETL operator | Load logs, rejections, approvals | Removal approvals after manual review | None |
 | Database administrator | All load objects | Grants and versioned DDL | Archive and delete logs after retention, using the procedure below |
-| Application reporting role | `analytics.daily_branch_summary` only | None | None |
+| Application reporting role (planned; not created yet) | `analytics.daily_branch_summary` only | None | None |
 | `anon` and other application users | None | None | None |
 
 Enable row-level security on the `etl_ops` load tables and revoke PUBLIC access, in the same way as the extraction and transformation log tables. Never expose `etl_ops` through the Supabase Data API. Expose `analytics` only if the application requires it, with SELECT-only grants and row-level security for the reporting role, and never to `anon`.
@@ -378,13 +379,21 @@ A completed run shows a short terminal summary:
 - The received, new, changed, unchanged, and removed counts
 - The quarantined count and the rate of the most affected stream, against its limit
 - The date the dashboard data is current through, or the last good run when nothing was published
+- For a manual run that publishes, the CSV file holding the published rows
 - What to do next, with the command to run
 
 The command ends with exit code 0 when the batch was published, 2 when it was held for MANUAL REVIEW, and 1 when it was rejected or failed, so a script or task scheduler can tell the outcomes apart.
 
 The full completion report is kept outside the terminal. The run's log file in `logs/` and `etl_ops.load_logs` hold the `load_run_id`, transformation and extraction run IDs, batch window and cutoff, rejected count, `refreshed_at`, and duration.
 
-Downstream users learn of new data through the published rows themselves. Dashboards display "Completed days through the day before `reporting_cutoff`, refreshed `refreshed_at`". When no publication occurs, the previous rows stay visible with an older `refreshed_at`, so users can see that today's refresh has not completed.
+**CSV export (manual runs):** After a manual run publishes, it saves the published rows in `exports/daily_branch_summary-<date>-<time>.csv`, named with the run's start time in Asia/Manila.
+
+- **Contents:** One header row, then one row per published date and branch. The columns are the 13 Section 2 columns, plus `branch_name` after `branch_id`.
+- **Source:** The file is read from `analytics.daily_branch_summary` after `COMMIT`, using only the rows stamped with this run's `load_run_id`, so it matches the publication exactly. Amounts keep their two decimals, and dates use YYYY-MM-DD.
+- **When no file is written:** A held or rejected batch writes no file. If saving fails, the publication still stands, and the summary asks the operator to run again to create the file.
+- **Scheduled runs:** These run inside PostgreSQL, which cannot write files on the operator's computer, so they produce no CSV.
+
+Downstream users learn of new data through the published rows themselves. Once the application's dashboards read the table, they display "Completed days through the day before `reporting_cutoff`, refreshed `refreshed_at`". When no publication occurs, the previous rows stay visible with an older `refreshed_at`, so users can see that today's refresh has not completed. Until that integration is built, the ETL operator checks new data in the Supabase Table Editor or in the CSV file of a manual run.
 
 ## 9. Common Load Problems and Mitigation
 
@@ -412,4 +421,4 @@ Stop publication when a mitigation requires changing business rules, the input c
 
 ## Expected Output
 
-One permanent `analytics.daily_branch_summary` table containing exactly the completed-day rows handed over by an approved Stage 2 run. The rows are published atomically with one `load_run_id`, `reporting_cutoff`, and `refreshed_at`, reconciled with the received batch, recorded in `etl_ops.load_publications`, and logged in `etl_ops.load_logs` with lineage to the transformation and extraction runs. Failed or held batches leave the previous publication unchanged. Load adds no new extraction or transformation logic.
+One permanent `analytics.daily_branch_summary` table containing exactly the completed-day rows handed over by an approved Stage 2 run. The rows are published atomically with one `load_run_id`, `reporting_cutoff`, and `refreshed_at`, reconciled with the received batch, recorded in `etl_ops.load_publications`, and logged in `etl_ops.load_logs` with lineage to the transformation and extraction runs. A manual run that publishes also saves those rows as a CSV file in `exports/`. Failed or held batches leave the previous publication unchanged. Load adds no new extraction or transformation logic.

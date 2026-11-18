@@ -4,7 +4,8 @@
     python -m pipeline.load --verbose     the same, printing every detail as it happens
     python -m pipeline.load --flush-logs  deliver queued load metadata
 
-A run prints a short summary; its full output is saved in logs/.
+A run prints a short summary; its full output is saved in logs/. A manual run
+that publishes also saves the published rows as a CSV file in exports/.
 
 The target `analytics.daily_branch_summary` and the restricted `etl_ops` load
 tables are created once by a database administrator with the load setup SQL.
@@ -20,6 +21,7 @@ Load core (Load.md Sections 1, 3, 4, 5, and 8):
 """
 
 import contextlib
+import csv
 import io
 import json
 import os
@@ -1163,6 +1165,7 @@ def save_load_logs(entries) -> int:
 # ---------------------------------------------------------------------------
 
 RUN_LOG_DIRECTORY = Path(__file__).resolve().parents[1] / 'logs'
+EXPORT_DIRECTORY = Path(__file__).resolve().parents[1] / 'exports'
 
 
 class _Tee:
@@ -1281,12 +1284,45 @@ def summary_facts(text, notes):
     return extraction_result, last_published
 
 
+def export_published_csv(started, load_run_id):
+    """Save the rows this run published as CSV in exports/; return (path, row count).
+
+    The file holds exactly the target rows stamped with this run's load_run_id,
+    read after the publication committed, with each branch's label from
+    public.branches. Returns (None, 0) when another run has published since.
+    """
+    columns = list(TARGET_COLUMNS)
+    header = columns[:2] + ['branch_name'] + columns[2:]
+    selected = sql.SQL(', ').join(
+        [sql.SQL('s.{}').format(sql.Identifier(column)) for column in columns[:2]]
+        + [sql.SQL('b.branch_name')]
+        + [sql.SQL('s.{}').format(sql.Identifier(column)) for column in columns[2:]])
+    with connect_source() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL(
+                'SELECT {} FROM {} s JOIN public.branches b ON b.id = s.branch_id '
+                'WHERE s.load_run_id = %s ORDER BY s.report_date, b.branch_name'
+            ).format(selected, sql.SQL(TARGET_TABLE)), (load_run_id,))
+            rows = cursor.fetchall()
+    if not rows:
+        return None, 0
+    EXPORT_DIRECTORY.mkdir(exist_ok=True)
+    stamp = started.astimezone(report.MANILA).strftime('%Y%m%d-%H%M%S')
+    path = EXPORT_DIRECTORY / f'daily_branch_summary-{stamp}.csv'
+    with path.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
+    return path, len(rows)
+
+
 def run_pipeline(verbose=False) -> int:
     """`python -m pipeline.load`: extraction, transformation, and load on one connection.
 
     While it runs, the terminal shows a loading animation with the current
     stage. It then shows a short summary (Load.md Section 8); the full output
     of every stage is saved in logs/, and --verbose also prints it as it happens.
+    When the batch is published, the published rows are also saved as CSV in exports/.
     """
     started = datetime.now(timezone.utc)
     loader = LoadConsumer()
@@ -1295,14 +1331,25 @@ def run_pipeline(verbose=False) -> int:
         _announce(progress, stage2, 'consume', '2/3 Transforming and checking the data')
         _announce(progress, loader, 'after_commit', '3/3 Loading the daily branch summary')
         text, notes = run_stages(stage2, loader, verbose)
+        load_entry = loader.log_entries[-1] if loader.log_entries else None
+        exported = None
+        if load_entry and load_entry.get('acceptance_status') == 'APPROVED':
+            progress.update('Saving the published rows as CSV')
+            try:
+                path, rows = export_published_csv(started, load_entry.get('load_run_id'))
+            except (psycopg.Error, SourceConnectionError, OSError):
+                path, rows = None, 0
+            if path:
+                exported = f"{path.relative_to(EXPORT_DIRECTORY.parent).as_posix()} ({report.plural(rows, 'row')})"
+            else:
+                notes.append('csv')
         progress.update('Preparing the summary')
         extraction_result, last_published = summary_facts(text, notes)
-    load_entry = loader.log_entries[-1] if loader.log_entries else None
     log_path = save_run_log(started, text)
     summary = report.render(
         started, extraction_result, stage2.result, load_entry, last_published=last_published,
         details_hint=log_path.relative_to(RUN_LOG_DIRECTORY.parent).as_posix() if log_path else None,
-        details=text, notes=notes)
+        details=text, notes=notes, exported=exported)
     print(summary)
     if log_path:
         with log_path.open('a', encoding='utf-8') as handle:

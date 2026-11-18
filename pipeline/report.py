@@ -265,13 +265,16 @@ def next_steps(extraction, stage2, load_entry, *, details='', notes=()):
                          'etl_ops.load_review_approvals, then run again.')
         elif code not in ('STALE_BATCH', 'DUPLICATE_BATCH'):
             steps.append('Read the details log to see which Load check failed.')
+    if 'csv' in notes:
+        steps.append('The data was published, but the CSV file could not be saved. '
+                     f'Run again to create it  ->  {RUN_COMMAND}')
     if 'transformation_logs' in notes or 'load_logs' in notes:
         steps.append('Some logs are not saved yet  ->  python -m pipeline.load --flush-logs')
     return steps
 
 
 def render(started, extraction, stage2, load_entry, *, last_published=None, details_hint=None,
-           details='', database_message=None, notes=()):
+           details='', database_message=None, notes=(), exported=None):
     """The short summary printed at the end of a run."""
     out = [f'I&C Laundry ETL - {manila_time(started)} (Asia/Manila)', '']
     if 'queued_logs' in notes:
@@ -284,6 +287,8 @@ def render(started, extraction, stage2, load_entry, *, last_published=None, deta
     if load_entry and load_entry.get('acceptance_status') == 'APPROVED' and load_entry.get('reporting_cutoff'):
         through = date.fromisoformat(str(load_entry['reporting_cutoff'])[:10]) - timedelta(days=1)
         out.append(f'Dashboard data is up to date through {calendar_day(through)}.')
+        if exported:
+            out.append(f'CSV file: {exported}')
     elif last_published:
         out.append(f'Nothing was published. The dashboard still shows the run from '
                    f'{manila_time(last_published)}.')

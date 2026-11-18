@@ -10,7 +10,7 @@ Extract the source records needed for daily branch reporting and prepare a trace
 
 ### Source system and database
 
-I&C Laundry uses a shared operational system for its Main, Calzada, and Nasugbu branches. The source is the existing Supabase PostgreSQL database, with operational and reference tables in the `public` schema.
+I&C Laundry uses a shared operational system for its Main, Calzada, and Nasugbu branches. The source is the existing Supabase PostgreSQL database, with operational and reference tables in the `public` schema. The source currently holds five active branch records: Downtown Branch, Riverside Branch, SAMPLE - Main, SAMPLE - Calzada, and SAMPLE - Nasugbu. Extraction reads all of them.
 
 ### Extraction method and tools
 

@@ -280,14 +280,14 @@ Store one row per transformation run in restricted `etl_ops.transformation_logs`
 | `quarantined_records` | Distinct quarantined rows across the transaction streams | `1` |
 | `quarantine_rates` | Quarantined rows, received rows, and rate for `orders`, `payments`, and `expenses` | `{"orders": {"quarantined": 1, "received": 35, "rate_percent": 2.9}, ...}` |
 | `quarantine_table`, `quarantine_rate_percent` | The stream with the highest rate, and that rate, which drives acceptance | `orders`, `2.9` |
-| `tolerance` | The limits applied (Section 10) | `{"auto_publish_max_percent": 5, "manual_review_max_percent": 10}` |
+| `tolerance`, `tolerance_policy` | The limits applied, and how they are applied: the stream with the highest rate decides (Section 10) | `{"auto_publish_max_percent": 5, "manual_review_max_percent": 10}`, `worst_stream_quarantine_rate` |
 | `rules_applied` | Rows affected per rule and table; counts may overlap | `[{"rule_id": "C-04", "table_name": "orders", "affected_rows": 1}, ...]` |
 | `issues` | Each finding: table, record UUID, rule ID, severity, and reason | `{"table_name": "orders", "rule_id": "C-04", "severity": "FAIL", "reason": "Negative numeric value", ...}` |
 | `validation_results` | Overall validation status and the issue list | `{"status": "PARTIAL", "issues": [...]}` |
 | `error_code`, `error_message` | Failure category and sanitized description when the batch is held or rejected | `QUARANTINE_REVIEW_REQUIRED`, `QUARANTINE_LIMIT_EXCEEDED`, `TRANSFORMATION_FAILED`, or absent |
 | `code_version`, `rule_version`, `schema_version` | Implementation, rule-set, and output-contract versions | `1.0.0`, `1.2.0`, `1.0.0` |
 
-Every run records `rule_version` `1.2.0`. The quarantine counts, rates, and `tolerance` are recorded when the Section 10 policy evaluates the batch, including clean runs (0 quarantined, 0% per stream). A batch with no output left after quarantining records `quarantined_records` only. A batch stopped by a schema, dimension, reconciliation, or empty-output check records `tolerance` with its issues and status, but no quarantine counts.
+Every run records `rule_version` `1.2.0`. The quarantine counts, rates, `tolerance`, and `tolerance_policy` are recorded when the Section 10 policy evaluates the batch, including clean runs (0 quarantined, 0% per stream). A batch with no output left after quarantining records `quarantined_records` only. A batch stopped by a schema, dimension, reconciliation, or empty-output check records `tolerance` and `tolerance_policy` with its issues and status, but no quarantine counts.
 
 - **Monitoring:** Track the daily decision, duration, output rows, and quarantine rate per stream.
 - **Troubleshooting:** The `issues` list names the rule, table, record, and reason; `error_code` explains a hold or rejection.
